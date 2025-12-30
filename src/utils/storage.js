@@ -1,0 +1,415 @@
+const fs = require('fs');
+const path = require('path');
+
+const CONFIG_PATH = path.join(__dirname, '../../config.json');
+const DATA_DIR = path.join(__dirname, '../../data');
+const USER_INDEX_PATH = path.join(DATA_DIR, 'user_index.json');
+const MEMBER_NAMES_PATH = path.join(DATA_DIR, 'member_names.json');
+
+// Cache for frequently accessed data
+// NOTE: This is RAM cache only - disk storage is unlimited
+const cache = {
+    config: null,
+    configMtime: 0,
+    userIndex: null,
+    userIndexMtime: 0,
+    memberNames: null,
+    memberNamesMtime: 0,
+    factionData: new Map(), // factionId -> { data, mtime, lastAccess }
+    maxCacheSize: 100 // Max factions to keep in RAM (not disk limit!)
+};
+
+function ensureDataDir() {
+    if (!fs.existsSync(DATA_DIR)) {
+        fs.mkdirSync(DATA_DIR, { recursive: true });
+    }
+}
+
+// ============================================
+// CONFIG
+// ============================================
+
+function loadConfig() {
+    try {
+        const stats = fs.statSync(CONFIG_PATH);
+        if (cache.config && cache.configMtime === stats.mtimeMs) {
+            return cache.config;
+        }
+        
+        const data = fs.readFileSync(CONFIG_PATH, 'utf8');
+        cache.config = JSON.parse(data);
+        cache.configMtime = stats.mtimeMs;
+        return cache.config;
+    } catch (error) {
+        return { factions: [], apikeys: [], currentKeyIndex: 0, failedKeys: {} };
+    }
+}
+
+function saveConfig(config) {
+    cache.config = config;
+    cache.configMtime = Date.now();
+    fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2));
+}
+
+// ============================================
+// API KEY MANAGEMENT
+// ============================================
+
+function markKeyFailed(key) {
+    const config = loadConfig();
+    config.failedKeys = config.failedKeys || {};
+    config.failedKeys[key] = Date.now();
+    saveConfig(config);
+}
+
+function markKeyWorking(key) {
+    const config = loadConfig();
+    if (config.failedKeys && config.failedKeys[key]) {
+        delete config.failedKeys[key];
+        saveConfig(config);
+    }
+}
+
+// ============================================
+// MEMBER NAMES
+// ============================================
+
+function loadMemberNames() {
+    ensureDataDir();
+    
+    try {
+        const stats = fs.statSync(MEMBER_NAMES_PATH);
+        if (cache.memberNames && cache.memberNamesMtime === stats.mtimeMs) {
+            return cache.memberNames;
+        }
+        
+        const data = fs.readFileSync(MEMBER_NAMES_PATH, 'utf8');
+        cache.memberNames = JSON.parse(data);
+        cache.memberNamesMtime = stats.mtimeMs;
+        return cache.memberNames;
+    } catch (error) {
+        return {};
+    }
+}
+
+function saveMemberNames(names) {
+    ensureDataDir();
+    cache.memberNames = names;
+    cache.memberNamesMtime = Date.now();
+    fs.writeFileSync(MEMBER_NAMES_PATH, JSON.stringify(names));
+}
+
+function updateMemberNames(members) {
+    const names = loadMemberNames();
+    let changed = false;
+    
+    for (const [id, data] of Object.entries(members)) {
+        if (data.name && names[id] !== data.name) {
+            names[id] = data.name;
+            changed = true;
+        }
+    }
+    
+    if (changed) {
+        saveMemberNames(names);
+    }
+}
+
+function getMemberName(userId) {
+    const names = loadMemberNames();
+    return names[userId] || null;
+}
+
+// ============================================
+// USER INDEX
+// ============================================
+
+function loadUserIndex() {
+    ensureDataDir();
+    
+    try {
+        const stats = fs.statSync(USER_INDEX_PATH);
+        if (cache.userIndex && cache.userIndexMtime === stats.mtimeMs) {
+            return cache.userIndex;
+        }
+        
+        const data = fs.readFileSync(USER_INDEX_PATH, 'utf8');
+        cache.userIndex = JSON.parse(data);
+        cache.userIndexMtime = stats.mtimeMs;
+        return cache.userIndex;
+    } catch (error) {
+        return {};
+    }
+}
+
+function saveUserIndex(index) {
+    ensureDataDir();
+    cache.userIndex = index;
+    cache.userIndexMtime = Date.now();
+    fs.writeFileSync(USER_INDEX_PATH, JSON.stringify(index));
+}
+
+function updateUserIndex(factionId, memberIds) {
+    const index = loadUserIndex();
+    let changed = false;
+    
+    for (const memberId of memberIds) {
+        const id = memberId.toString();
+        if (!index[id]) {
+            index[id] = [];
+        }
+        if (!index[id].includes(factionId)) {
+            index[id].push(factionId);
+            changed = true;
+        }
+    }
+    
+    if (changed) {
+        saveUserIndex(index);
+    }
+}
+
+function getUserFactions(userId) {
+    const index = loadUserIndex();
+    return index[userId.toString()] || [];
+}
+
+// ============================================
+// FACTION DATA
+// ============================================
+
+function getFactionDataPath(factionId) {
+    return path.join(DATA_DIR, `faction_${factionId}.json`);
+}
+
+function evictOldestFromCache() {
+    if (cache.factionData.size < cache.maxCacheSize) return;
+    
+    // Find least recently accessed
+    let oldestKey = null;
+    let oldestTime = Infinity;
+    
+    for (const [key, value] of cache.factionData) {
+        if (value.lastAccess < oldestTime) {
+            oldestTime = value.lastAccess;
+            oldestKey = key;
+        }
+    }
+    
+    if (oldestKey !== null) {
+        cache.factionData.delete(oldestKey);
+    }
+}
+
+function loadFactionData(factionId, useCache = true) {
+    ensureDataDir();
+    const filePath = getFactionDataPath(factionId);
+    
+    try {
+        const stats = fs.statSync(filePath);
+        
+        if (useCache) {
+            const cached = cache.factionData.get(factionId);
+            if (cached && cached.mtime === stats.mtimeMs) {
+                cached.lastAccess = Date.now();
+                return cached.data;
+            }
+        }
+        
+        const data = fs.readFileSync(filePath, 'utf8');
+        const parsed = JSON.parse(data);
+        
+        // Manage cache size (LRU eviction)
+        evictOldestFromCache();
+        
+        cache.factionData.set(factionId, { 
+            data: parsed, 
+            mtime: stats.mtimeMs,
+            lastAccess: Date.now()
+        });
+        
+        return parsed;
+    } catch (error) {
+        return {
+            factionId: factionId,
+            name: null,
+            snapshots: []
+        };
+    }
+}
+
+function saveFactionData(factionId, data) {
+    ensureDataDir();
+    const filePath = getFactionDataPath(factionId);
+    
+    // Update cache
+    cache.factionData.set(factionId, { 
+        data, 
+        mtime: Date.now(),
+        lastAccess: Date.now()
+    });
+    
+    // Write to file (compact JSON, no formatting)
+    fs.writeFileSync(filePath, JSON.stringify(data));
+}
+
+function addSnapshot(factionId, factionName, timestamp, activeMembers, totalMembers, allMemberIds) {
+    const data = loadFactionData(factionId, false);
+    data.name = factionName;
+    
+    // Use compact format
+    data.snapshots.push({
+        t: timestamp,
+        a: activeMembers,
+        n: totalMembers
+    });
+    
+    // Prune old data (older than 30 days)
+    const thirtyDaysAgo = Math.floor(Date.now() / 1000) - (30 * 24 * 60 * 60);
+    data.snapshots = data.snapshots.filter(s => (s.t || s.timestamp) >= thirtyDaysAgo);
+    
+    saveFactionData(factionId, data);
+    
+    // Update user index with all members
+    if (allMemberIds && allMemberIds.length > 0) {
+        updateUserIndex(factionId, allMemberIds);
+    }
+}
+
+// Normalize snapshot format (handle both old and new formats)
+function normalizeSnapshot(snapshot) {
+    return {
+        timestamp: snapshot.t || snapshot.timestamp,
+        active: snapshot.a || snapshot.active || [],
+        total: snapshot.n || snapshot.total || 0
+    };
+}
+
+function getSnapshotsNormalized(factionData) {
+    return (factionData.snapshots || []).map(normalizeSnapshot);
+}
+
+// ============================================
+// MULTI-FACTION SEARCH
+// ============================================
+
+function findUserInAllFactions(userId) {
+    const factionIds = getUserFactions(userId);
+    
+    if (factionIds.length === 0) {
+        // Fallback: scan all faction files (slower, but needed for initial index building)
+        return scanAllFactionsForUser(userId);
+    }
+    
+    return factionIds;
+}
+
+function scanAllFactionsForUser(userId) {
+    ensureDataDir();
+    const files = fs.readdirSync(DATA_DIR).filter(f => 
+        f.startsWith('faction_') && f.endsWith('.json')
+    );
+    
+    const foundFactions = [];
+    
+    for (const file of files) {
+        const match = file.match(/faction_(\d+)\.json/);
+        if (!match) continue;
+        
+        const factionId = parseInt(match[1]);
+        const data = loadFactionData(factionId);
+        const snapshots = getSnapshotsNormalized(data);
+        
+        for (const snapshot of snapshots) {
+            if (snapshot.active.includes(userId)) {
+                foundFactions.push(factionId);
+                break;
+            }
+        }
+    }
+    
+    // Update index for future lookups
+    if (foundFactions.length > 0) {
+        const index = loadUserIndex();
+        index[userId.toString()] = foundFactions;
+        saveUserIndex(index);
+    }
+    
+    return foundFactions;
+}
+
+function getAllTrackedFactionIds() {
+    ensureDataDir();
+    const files = fs.readdirSync(DATA_DIR).filter(f => 
+        f.startsWith('faction_') && f.endsWith('.json')
+    );
+    
+    return files.map(f => {
+        const match = f.match(/faction_(\d+)\.json/);
+        return match ? parseInt(match[1]) : null;
+    }).filter(id => id !== null);
+}
+
+function getAllFactionData() {
+    const factionIds = getAllTrackedFactionIds();
+    const factions = {};
+    
+    for (const factionId of factionIds) {
+        factions[factionId] = loadFactionData(factionId);
+    }
+    
+    return factions;
+}
+
+// Get basic stats without loading all data
+function getFactionStats() {
+    ensureDataDir();
+    const config = loadConfig();
+    const stats = {
+        configured: config.factions.length,
+        withData: 0,
+        totalSnapshots: 0
+    };
+    
+    const files = fs.readdirSync(DATA_DIR).filter(f => 
+        f.startsWith('faction_') && f.endsWith('.json')
+    );
+    
+    stats.withData = files.length;
+    
+    return stats;
+}
+
+// ============================================
+// CLEANUP
+// ============================================
+
+function clearCache() {
+    cache.config = null;
+    cache.userIndex = null;
+    cache.memberNames = null;
+    cache.factionData.clear();
+}
+
+module.exports = {
+    loadConfig,
+    saveConfig,
+    markKeyFailed,
+    markKeyWorking,
+    loadFactionData,
+    saveFactionData,
+    addSnapshot,
+    getSnapshotsNormalized,
+    normalizeSnapshot,
+    loadMemberNames,
+    updateMemberNames,
+    getMemberName,
+    loadUserIndex,
+    getUserFactions,
+    updateUserIndex,
+    findUserInAllFactions,
+    getAllFactionData,
+    getAllTrackedFactionIds,
+    getFactionStats,
+    clearCache
+};
