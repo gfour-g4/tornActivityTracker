@@ -11,9 +11,6 @@ const GRANULARITY_CHOICES = [
 ];
 
 const RANK_CHOICES = [
-    { name: 'Bronze', value: 'bronze' },
-    { name: 'Silver', value: 'silver' },
-    { name: 'Gold', value: 'gold' },
     { name: 'Platinum', value: 'platinum' },
     { name: 'Diamond', value: 'diamond' }
 ];
