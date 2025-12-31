@@ -141,11 +141,10 @@ async function ensureHOFCache() {
     return loadHOFCache();
 }
 
-function getFactionsbyRank(rankName, maxMembers = null) {
+function getFactionsbyRank(rankName, minMembers = null, maxMembers = null) {
     const cache = loadHOFCache();
     const rankLower = rankName.toLowerCase();
     
-    // Validate rank
     if (!TRACKED_RANKS.includes(rankLower)) {
         console.warn(`[HOF] Rank "${rankName}" is not tracked. Only ${TRACKED_RANKS.join(', ')} are available.`);
         return [];
@@ -155,6 +154,10 @@ function getFactionsbyRank(rankName, maxMembers = null) {
         const factionRank = (f.rank || '').toLowerCase();
         return factionRank.includes(rankLower);
     });
+    
+    if (minMembers !== null && minMembers > 0) {
+        filtered = filtered.filter(f => f.members >= minMembers);
+    }
     
     if (maxMembers !== null && maxMembers > 0) {
         filtered = filtered.filter(f => f.members <= maxMembers);

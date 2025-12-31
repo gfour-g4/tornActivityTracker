@@ -121,8 +121,15 @@ module.exports = {
                 )
                 .addIntegerOption(option =>
                     option
+                        .setName('min-members')
+                        .setDescription('Minimum member count')
+                        .setMinValue(1)
+                        .setMaxValue(100)
+                )
+                .addIntegerOption(option =>
+                    option
                         .setName('max-members')
-                        .setDescription('Maximum member count (optional)')
+                        .setDescription('Maximum member count')
                         .setMinValue(1)
                         .setMaxValue(100)
                 )
@@ -159,6 +166,20 @@ module.exports = {
                         .setDescription('Faction rank')
                         .setRequired(true)
                         .addChoices(...RANK_CHOICES)
+                )
+                .addIntegerOption(option =>
+                    option
+                        .setName('min-members')
+                        .setDescription('Minimum member count')
+                        .setMinValue(1)
+                        .setMaxValue(100)
+                )
+                .addIntegerOption(option =>
+                    option
+                        .setName('max-members')
+                        .setDescription('Maximum member count')
+                        .setMinValue(1)
+                        .setMaxValue(100)
                 )
         )
         .addSubcommand(subcommand =>
@@ -443,15 +464,15 @@ async function handleAddFactions(interaction) {
 
 async function handleAddRank(interaction) {
     const rank = interaction.options.getString('rank');
+    const minMembers = interaction.options.getInteger('min-members');
     const maxMembers = interaction.options.getInteger('max-members');
     
     await interaction.deferReply({ ephemeral: true });
     
     try {
-        // Ensure HOF cache is up to date
         await hof.ensureHOFCache();
         
-        const result = storage.addFactionsByRank(rank, maxMembers);
+        const result = storage.addFactionsByRank(rank, minMembers, maxMembers);
         
         let response = `✅ Added **${result.added}** ${rank} faction(s)`;
         
@@ -459,8 +480,12 @@ async function handleAddRank(interaction) {
             response += ` (${result.skipped} already tracked)`;
         }
         
-        if (maxMembers) {
-            response += `\n📊 Filter: max ${maxMembers} members`;
+        // Show filter info
+        const filters = [];
+        if (minMembers) filters.push(`min ${minMembers}`);
+        if (maxMembers) filters.push(`max ${maxMembers}`);
+        if (filters.length > 0) {
+            response += `\n📊 Filter: ${filters.join(', ')} members`;
         }
         
         if (result.added > 0 && result.added <= 10) {
@@ -469,7 +494,6 @@ async function handleAddRank(interaction) {
             ).join('\n');
         }
         
-        // Show estimate
         const config = storage.loadConfig();
         const estimate = api.estimateCollectionTime(config.factions.length);
         response += `\n\n📈 Now tracking **${config.factions.length}** factions`;
@@ -486,6 +510,7 @@ async function handleAddRank(interaction) {
         await interaction.editReply({ content: `❌ Error: ${error.message}` });
     }
 }
+
 
 async function handleAddKeys(interaction) {
     const keysInput = interaction.options.getString('keys');
@@ -536,21 +561,31 @@ async function handleRemoveFactions(interaction) {
 
 async function handleRemoveRank(interaction) {
     const rank = interaction.options.getString('rank');
+    const minMembers = interaction.options.getInteger('min-members');
+    const maxMembers = interaction.options.getInteger('max-members');
     
     await interaction.deferReply({ ephemeral: true });
     
     try {
         await hof.ensureHOFCache();
         
-        const result = storage.removeFactionsByRank(rank);
+        const result = storage.removeFactionsByRank(rank, minMembers, maxMembers);
         
         let response = result.removed > 0
             ? `✅ Removed **${result.removed}** ${rank} faction(s)`
-            : `⚠️ No ${rank} factions were being tracked.`;
+            : `⚠️ No matching ${rank} factions were being tracked.`;
+        
+        // Show filter info
+        const filters = [];
+        if (minMembers) filters.push(`min ${minMembers}`);
+        if (maxMembers) filters.push(`max ${maxMembers}`);
+        if (filters.length > 0) {
+            response += `\n📊 Filter: ${filters.join(', ')} members`;
+        }
         
         if (result.removed > 0 && result.removed <= 10) {
             response += '\n\n**Removed:**\n' + result.factions.map(f => 
-                `• ${f.name} [${f.id}]`
+                `• ${f.name} [${f.id}] - ${f.members} members`
             ).join('\n');
         }
         

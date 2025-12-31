@@ -545,9 +545,9 @@ function getAllMemberChoices() {
 // RANK-BASED FACTION MANAGEMENT
 // ============================================
 
-function addFactionsByRank(rankName, maxMembers = null) {
+function addFactionsByRank(rankName, minMembers = null, maxMembers = null) {
     const hof = require('./hof');
-    const factions = hof.getFactionsbyRank(rankName, maxMembers);
+    const factions = hof.getFactionsbyRank(rankName, minMembers, maxMembers);
     
     if (factions.length === 0) {
         return { added: 0, skipped: 0, factions: [] };
@@ -575,9 +575,9 @@ function addFactionsByRank(rankName, maxMembers = null) {
     return { added, skipped, factions: addedFactions };
 }
 
-function removeFactionsByRank(rankName) {
+function removeFactionsByRank(rankName, minMembers = null, maxMembers = null) {
     const hof = require('./hof');
-    const factions = hof.getFactionsbyRank(rankName);
+    const factions = hof.getFactionsbyRank(rankName, minMembers, maxMembers);
     
     if (factions.length === 0) {
         return { removed: 0, factions: [] };
