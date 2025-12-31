@@ -6,9 +6,8 @@ const RETRY_DELAY = 1000;
 
 // Rate limiting: 20 calls per minute per key
 const RATE_LIMIT_PER_KEY = 20;
-const RATE_LIMIT_WINDOW = 60 * 1000; // 1 minute
+const RATE_LIMIT_WINDOW = 60 * 1000;
 
-// Track API calls per key: { key: [timestamp1, timestamp2, ...] }
 const apiCallLog = new Map();
 
 async function sleep(ms) {
@@ -38,10 +37,9 @@ function getTimeUntilSlotAvailable(key) {
     if (calls.length < RATE_LIMIT_PER_KEY) {
         return 0;
     }
-    // Find when the oldest call will expire
     const oldestCall = Math.min(...calls);
     const timeUntilExpiry = (oldestCall + RATE_LIMIT_WINDOW) - Date.now();
-    return Math.max(0, timeUntilExpiry + 100); // Add 100ms buffer
+    return Math.max(0, timeUntilExpiry + 100);
 }
 
 async function waitForRateLimit(key) {
@@ -62,7 +60,6 @@ function findBestKey(excludeKeys = []) {
     const now = Date.now();
     config.failedKeys = config.failedKeys || {};
     
-    // Clean up old failures (retry after 5 minutes)
     let changed = false;
     for (const key of Object.keys(config.failedKeys)) {
         if (now - config.failedKeys[key] > 5 * 60 * 1000) {
@@ -74,13 +71,11 @@ function findBestKey(excludeKeys = []) {
         storage.saveConfig(config);
     }
     
-    // Find available keys (not excluded, not failed)
     const availableKeys = config.apikeys.filter(k => 
         !excludeKeys.includes(k) && !config.failedKeys[k]
     );
     
     if (availableKeys.length === 0) {
-        // All keys failed or excluded, reset failed keys and try first available
         if (Object.keys(config.failedKeys).length > 0) {
             config.failedKeys = {};
             storage.saveConfig(config);
@@ -89,7 +84,6 @@ function findBestKey(excludeKeys = []) {
         return null;
     }
     
-    // Find key with lowest current usage (most capacity remaining)
     let bestKey = null;
     let lowestUsage = Infinity;
     
@@ -111,13 +105,12 @@ async function fetchWithRetry(url, usedKeys = [], attempt = 1) {
         throw new Error('No API keys available. All keys may have failed or be rate limited.');
     }
     
-    // Wait for rate limit if needed
     await waitForRateLimit(apiKey);
     
-    const fullUrl = `${url}&key=${apiKey}`;
+    const separator = url.includes('?') ? '&' : '?';
+    const fullUrl = `${url}${separator}key=${apiKey}`;
     
     try {
-        // Log the call before making it
         logCall(apiKey);
         
         const response = await fetch(fullUrl);
@@ -132,7 +125,6 @@ async function fetchWithRetry(url, usedKeys = [], attempt = 1) {
             const errorCode = data.error.code;
             const errorMsg = data.error.error;
             
-            // Key-related errors - try next key
             if ([1, 2, 10, 13].includes(errorCode)) {
                 console.error(`[API] Key error (${errorCode}): ${errorMsg}. Trying next key...`);
                 storage.markKeyFailed(apiKey);
@@ -145,28 +137,23 @@ async function fetchWithRetry(url, usedKeys = [], attempt = 1) {
                 throw new Error(`All API keys failed. Last error: ${errorMsg}`);
             }
             
-            // Rate limit from Torn's side - wait and retry
             if (errorCode === 5) {
                 console.log('[API] Torn rate limit hit. Waiting 30 seconds...');
                 await sleep(30000);
                 return fetchWithRetry(url, usedKeys, attempt);
             }
             
-            // IP ban - stop everything
             if (errorCode === 8) {
                 throw new Error('IP is banned from Torn API. Please contact Torn support.');
             }
             
-            // Other errors - don't retry
             throw new Error(`Torn API error: ${errorMsg}`);
         }
         
-        // Success - mark key as working
         storage.markKeyWorking(apiKey);
         return data;
         
     } catch (error) {
-        // Network errors - try next key
         if (error.message.includes('fetch') || 
             error.message.includes('network') || 
             error.message.includes('ETIMEDOUT') ||
@@ -189,6 +176,50 @@ async function fetchWithRetry(url, usedKeys = [], attempt = 1) {
 async function fetchFaction(factionId) {
     const url = `${API_BASE}/faction/${factionId}?selections=basic`;
     return fetchWithRetry(url);
+}
+
+async function fetchHOFPage(offset = 0, limit = 100) {
+    const url = `${API_BASE}/v2/torn/factionhof?cat=rank&limit=${limit}&offset=${offset}`;
+    return fetchWithRetry(url);
+}
+
+async function fetchAllHOF(progressCallback = null) {
+    const allFactions = [];
+    let offset = 0;
+    const limit = 100;
+    let hasMore = true;
+    let page = 0;
+    
+    while (hasMore) {
+        page++;
+        if (progressCallback) {
+            progressCallback(page, allFactions.length);
+        }
+        
+        const data = await fetchHOFPage(offset, limit);
+        
+        if (!data.factionhof || data.factionhof.length === 0) {
+            hasMore = false;
+        } else {
+            allFactions.push(...data.factionhof);
+            offset += limit;
+            
+            // Check if there's a next page
+            if (!data._metadata?.links?.next) {
+                hasMore = false;
+            }
+            
+            // Safety limit - there shouldn't be more than 5000 factions in HOF
+            if (allFactions.length >= 5000) {
+                hasMore = false;
+            }
+            
+            // Small delay between pages
+            await sleep(500);
+        }
+    }
+    
+    return allFactions;
 }
 
 function processActivitySnapshot(factionData, pollTimestamp) {
@@ -216,7 +247,6 @@ function processActivitySnapshot(factionData, pollTimestamp) {
     };
 }
 
-// Get rate limit status for all keys
 function getRateLimitStatus() {
     const config = storage.loadConfig();
     const status = {};
@@ -237,7 +267,6 @@ function getRateLimitStatus() {
     return status;
 }
 
-// Calculate estimated time to collect N factions
 function estimateCollectionTime(factionCount) {
     const config = storage.loadConfig();
     const keyCount = config.apikeys.length;
@@ -247,11 +276,13 @@ function estimateCollectionTime(factionCount) {
     const totalCallsPerMinute = keyCount * RATE_LIMIT_PER_KEY;
     const minutes = factionCount / totalCallsPerMinute;
     
-    return Math.ceil(minutes * 60); // Return seconds
+    return Math.ceil(minutes * 60);
 }
 
 module.exports = {
     fetchFaction,
+    fetchHOFPage,
+    fetchAllHOF,
     processActivitySnapshot,
     getRateLimitStatus,
     estimateCollectionTime,

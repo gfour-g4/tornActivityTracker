@@ -541,6 +541,147 @@ function getAllMemberChoices() {
     return choices.slice(0, 25);
 }
 
+// ============================================
+// RANK-BASED FACTION MANAGEMENT
+// ============================================
+
+function addFactionsByRank(rankName, maxMembers = null) {
+    const hof = require('./hof');
+    const factions = hof.getFactionsbyRank(rankName, maxMembers);
+    
+    if (factions.length === 0) {
+        return { added: 0, skipped: 0, factions: [] };
+    }
+    
+    const config = loadConfig();
+    let added = 0;
+    let skipped = 0;
+    const addedFactions = [];
+    
+    for (const faction of factions) {
+        if (!config.factions.includes(faction.id)) {
+            config.factions.push(faction.id);
+            addedFactions.push(faction);
+            added++;
+        } else {
+            skipped++;
+        }
+    }
+    
+    if (added > 0) {
+        saveConfig(config);
+    }
+    
+    return { added, skipped, factions: addedFactions };
+}
+
+function removeFactionsByRank(rankName) {
+    const hof = require('./hof');
+    const factions = hof.getFactionsbyRank(rankName);
+    
+    if (factions.length === 0) {
+        return { removed: 0, factions: [] };
+    }
+    
+    const config = loadConfig();
+    const factionIds = factions.map(f => f.id);
+    const initialLength = config.factions.length;
+    const removedFactions = [];
+    
+    config.factions = config.factions.filter(id => {
+        if (factionIds.includes(id)) {
+            const faction = factions.find(f => f.id === id);
+            if (faction) removedFactions.push(faction);
+            return false;
+        }
+        return true;
+    });
+    
+    const removed = initialLength - config.factions.length;
+    
+    if (removed > 0) {
+        saveConfig(config);
+    }
+    
+    return { removed, factions: removedFactions };
+}
+
+function addFactionsByIds(ids) {
+    const config = loadConfig();
+    let added = 0;
+    let skipped = 0;
+    
+    for (const id of ids) {
+        if (!config.factions.includes(id)) {
+            config.factions.push(id);
+            added++;
+        } else {
+            skipped++;
+        }
+    }
+    
+    if (added > 0) {
+        saveConfig(config);
+    }
+    
+    return { added, skipped };
+}
+
+function removeFactionsByIds(ids) {
+    const config = loadConfig();
+    const initialLength = config.factions.length;
+    
+    config.factions = config.factions.filter(id => !ids.includes(id));
+    
+    const removed = initialLength - config.factions.length;
+    
+    if (removed > 0) {
+        saveConfig(config);
+    }
+    
+    return { removed };
+}
+
+function addApiKeys(keys) {
+    const config = loadConfig();
+    let added = 0;
+    let skipped = 0;
+    
+    for (const key of keys) {
+        if (!config.apikeys.includes(key)) {
+            config.apikeys.push(key);
+            added++;
+        } else {
+            skipped++;
+        }
+    }
+    
+    if (added > 0) {
+        saveConfig(config);
+    }
+    
+    return { added, skipped };
+}
+
+function removeApiKey(key) {
+    const config = loadConfig();
+    const index = config.apikeys.indexOf(key);
+    
+    if (index === -1) {
+        return { removed: false };
+    }
+    
+    config.apikeys.splice(index, 1);
+    
+    if (config.currentKeyIndex >= config.apikeys.length) {
+        config.currentKeyIndex = 0;
+    }
+    
+    saveConfig(config);
+    
+    return { removed: true };
+}
+
 module.exports = {
     loadConfig,
     saveConfig,
@@ -567,5 +708,12 @@ module.exports = {
     resolveFaction,
     resolveMember,
     getAllFactionChoices,
-    getAllMemberChoices
+    getAllMemberChoices,
+    // New exports
+    addFactionsByRank,
+    removeFactionsByRank,
+    addFactionsByIds,
+    removeFactionsByIds,
+    addApiKeys,
+    removeApiKey
 };

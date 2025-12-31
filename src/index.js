@@ -4,7 +4,6 @@ const { Client, GatewayIntentBits, Collection, REST, Routes } = require('discord
 const collector = require('./collector');
 
 const activityCommand = require('./commands/activity');
-const configCommand = require('./commands/config');
 const exportCommand = require('./commands/export');
 
 const client = new Client({ 
@@ -13,7 +12,6 @@ const client = new Client({
 
 client.commands = new Collection();
 client.commands.set(activityCommand.data.name, activityCommand);
-client.commands.set(configCommand.data.name, configCommand);
 client.commands.set(exportCommand.data.name, exportCommand);
 
 async function registerCommands() {
@@ -21,7 +19,6 @@ async function registerCommands() {
     
     const commands = [
         activityCommand.data.toJSON(),
-        configCommand.data.toJSON(),
         exportCommand.data.toJSON()
     ];
     
@@ -48,7 +45,6 @@ client.once('ready', async () => {
 });
 
 client.on('interactionCreate', async interaction => {
-    // Handle autocomplete
     if (interaction.isAutocomplete()) {
         const command = client.commands.get(interaction.commandName);
         
@@ -62,7 +58,6 @@ client.on('interactionCreate', async interaction => {
         return;
     }
     
-    // Handle commands
     if (!interaction.isChatInputCommand()) return;
     
     const command = client.commands.get(interaction.commandName);

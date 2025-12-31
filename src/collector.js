@@ -1,12 +1,14 @@
 const api = require('./utils/api');
 const storage = require('./utils/storage');
+const hof = require('./utils/hof');
 
 let collectorInterval = null;
+let hofInterval = null;
 let isCollecting = false;
 let lastCollectionStats = null;
 
-// Collection interval: 15 minutes
-const COLLECTION_INTERVAL = 15 * 60 * 1000;
+const COLLECTION_INTERVAL = 15 * 60 * 1000; // 15 minutes
+const HOF_UPDATE_INTERVAL = 7 * 24 * 60 * 60 * 1000; // 7 days
 
 async function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
@@ -18,10 +20,8 @@ async function collectFactionData(factionId) {
         const factionData = await api.fetchFaction(factionId);
         const { active, total, allMemberIds, members } = api.processActivitySnapshot(factionData, pollTimestamp);
         
-        // Update member names
         storage.updateMemberNames(members);
         
-        // Add snapshot
         storage.addSnapshot(
             factionId, 
             factionData.name, 
@@ -65,13 +65,7 @@ async function collectAllFactions() {
     console.log(`[${new Date().toISOString()}] Starting collection...`);
     console.log(`  Factions: ${config.factions.length}`);
     console.log(`  API Keys: ${config.apikeys.length}`);
-    console.log(`  Rate Limit: ${api.RATE_LIMIT_PER_KEY} calls/min/key`);
     console.log(`  Estimated time: ${Math.ceil(estimatedTime / 60)} minutes`);
-    
-    if (estimatedTime > 14 * 60) {
-        console.warn(`  ⚠️ Warning: Collection may not finish before next interval!`);
-        console.warn(`     Consider adding more API keys.`);
-    }
     
     const results = {
         success: 0,
@@ -81,7 +75,6 @@ async function collectAllFactions() {
         endTime: null
     };
     
-    // Process factions one by one - rate limiting is handled by API module
     let processedCount = 0;
     
     for (const factionId of config.factions) {
@@ -90,7 +83,6 @@ async function collectAllFactions() {
         
         if (result.success) {
             results.success++;
-            // Log progress every 50 factions or for small collections
             if (config.factions.length <= 20 || processedCount % 50 === 0) {
                 console.log(`  [${processedCount}/${config.factions.length}] ✓ ${result.name}: ${result.active}/${result.total} active`);
             }
@@ -100,7 +92,6 @@ async function collectAllFactions() {
             console.log(`  [${processedCount}/${config.factions.length}] ✗ Faction ${factionId}: ${result.error}`);
         }
         
-        // Small delay between requests to be nice
         await sleep(100);
     }
     
@@ -118,6 +109,17 @@ async function collectAllFactions() {
     return results;
 }
 
+async function updateHOFIfNeeded() {
+    if (hof.isHOFCacheStale()) {
+        console.log('[Collector] HOF cache is stale, updating...');
+        try {
+            await hof.updateHOFCache();
+        } catch (error) {
+            console.error('[Collector] Failed to update HOF cache:', error.message);
+        }
+    }
+}
+
 function startCollector() {
     if (collectorInterval) {
         console.log('[Collector] Already running.');
@@ -130,19 +132,31 @@ function startCollector() {
     console.log(`  Using ${config.apikeys.length} API keys`);
     console.log(`  Collection interval: 15 minutes`);
     
+    // Update HOF on startup if needed
+    updateHOFIfNeeded();
+    
     // Collect immediately on start
     collectAllFactions();
     
     // Then every 15 minutes
     collectorInterval = setInterval(collectAllFactions, COLLECTION_INTERVAL);
+    
+    // Check HOF daily
+    hofInterval = setInterval(updateHOFIfNeeded, 24 * 60 * 60 * 1000);
 }
 
 function stopCollector() {
     if (collectorInterval) {
         clearInterval(collectorInterval);
         collectorInterval = null;
-        console.log('[Collector] Stopped.');
     }
+    
+    if (hofInterval) {
+        clearInterval(hofInterval);
+        hofInterval = null;
+    }
+    
+    console.log('[Collector] Stopped.');
 }
 
 function getCollectorStatus() {
