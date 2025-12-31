@@ -72,31 +72,12 @@ async function collectAllFactions() {
     const results = {
         success: 0,
         failed: 0,
-        skipped: 0,
         errors: [],
         startTime,
         endTime: null
     };
     
-    // Filter out inactive factions (collect them less frequently)
-    const factionQueue = [];
-    const skippedInactive = [];
-    
-    for (const factionId of config.factions) {
-        if (db.isInactiveFaction(factionId)) {
-            // Skip 75% of the time for inactive factions
-            if (Math.random() < 0.75) {
-                skippedInactive.push(factionId);
-                results.skipped++;
-                continue;
-            }
-        }
-        factionQueue.push(factionId);
-    }
-    
-    if (skippedInactive.length > 0) {
-        console.log(`  Skipping ${skippedInactive.length} inactive factions`);
-    }
+    const factionQueue = [...config.factions];
     
     let processedCount = 0;
     const totalToProcess = factionQueue.length;
@@ -135,7 +116,6 @@ async function collectAllFactions() {
     console.log(`[${new Date().toISOString()}] Collection complete!`);
     console.log(`  Success: ${results.success}`);
     console.log(`  Failed: ${results.failed}`);
-    console.log(`  Skipped (inactive): ${results.skipped}`);
     console.log(`  Duration: ${Math.floor(duration / 60)}m ${Math.floor(duration % 60)}s`);
     
     lastCollectionStats = results;
