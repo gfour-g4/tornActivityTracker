@@ -100,12 +100,13 @@ module.exports = {
         .addSubcommand(subcommand =>
             subcommand
                 .setName('add-factions')
-                .setDescription('Add factions to track by ID')
+                .setDescription('Add factions to track')
                 .addStringOption(option =>
                     option
-                        .setName('ids')
-                        .setDescription('Comma-separated faction IDs')
+                        .setName('factions')
+                        .setDescription('Faction names or IDs (comma-separated)')
                         .setRequired(true)
+                        .setAutocomplete(true)
                 )
         )
         .addSubcommand(subcommand =>
@@ -151,9 +152,10 @@ module.exports = {
                 .setDescription('Remove factions from tracking')
                 .addStringOption(option =>
                     option
-                        .setName('ids')
-                        .setDescription('Comma-separated faction IDs')
+                        .setName('factions')
+                        .setDescription('Faction names or IDs (comma-separated)')
                         .setRequired(true)
+                        .setAutocomplete(true)
                 )
         )
         .addSubcommand(subcommand =>
@@ -214,49 +216,83 @@ module.exports = {
                 .setDescription('Manually refresh the faction Hall of Fame cache')
         ),
 
-    async autocomplete(interaction) {
-        const focusedOption = interaction.options.getFocused(true);
-        const value = focusedOption.value;
-        
-        let choices = [];
-        
-        if (focusedOption.name === 'user') {
-            if (value.length === 0) {
-                choices = storage.getAllMemberChoices();
-            } else {
-                choices = storage.searchMemberByName(value).map(m => ({
-                    name: `${m.name} [${m.id}]`,
-                    value: m.id.toString()
-                }));
-            }
-        } else if (['faction', 'faction1', 'faction2'].includes(focusedOption.name)) {
-            if (value.length === 0) {
-                choices = storage.getAllFactionChoices();
-            } else {
-                // Search both tracked factions and HOF
-                const tracked = storage.searchFactionByName(value);
-                const hofResults = hof.searchHOFByName(value);
-                
-                // Merge results, prioritizing tracked factions
-                const seen = new Set(tracked.map(f => f.id));
-                const merged = [...tracked];
-                
-                for (const f of hofResults) {
-                    if (!seen.has(f.id)) {
-                        merged.push(f);
-                        seen.add(f.id);
-                    }
+        async autocomplete(interaction) {
+            const focusedOption = interaction.options.getFocused(true);
+            const value = focusedOption.value;
+            const subcommand = interaction.options.getSubcommand();
+            
+            let choices = [];
+            
+            if (focusedOption.name === 'user') {
+                if (value.length === 0) {
+                    choices = storage.getAllMemberChoices();
+                } else {
+                    choices = storage.searchMemberByName(value).map(m => ({
+                        name: `${m.name} [${m.id}]`,
+                        value: m.id.toString()
+                    }));
                 }
+            } else if (focusedOption.name === 'factions') {
+                // For add-factions and remove-factions
+                // Get the last item being typed (after last comma)
+                const parts = value.split(',');
+                const current = parts[parts.length - 1].trim();
+                const prefix = parts.slice(0, -1).join(',');
                 
-                choices = merged.slice(0, 25).map(f => ({
-                    name: `${f.name} [${f.id}]`,
-                    value: f.id.toString()
-                }));
+                if (current.length === 0) {
+                    // Show HOF factions
+                    const hofFactions = hof.loadHOFCache().factions.slice(0, 25);
+                    choices = hofFactions.map(f => ({
+                        name: `${f.name} [${f.id}]`,
+                        value: prefix ? `${prefix},${f.id}` : f.id.toString()
+                    }));
+                } else {
+                    // Search HOF and tracked factions
+                    const hofResults = hof.searchHOFByName(current);
+                    const trackedResults = storage.searchFactionByName(current);
+                    
+                    // Merge results
+                    const seen = new Set();
+                    const merged = [];
+                    
+                    for (const f of [...trackedResults, ...hofResults]) {
+                        if (!seen.has(f.id)) {
+                            merged.push(f);
+                            seen.add(f.id);
+                        }
+                    }
+                    
+                    choices = merged.slice(0, 25).map(f => ({
+                        name: `${f.name} [${f.id}]`,
+                        value: prefix ? `${prefix},${f.id}` : f.id.toString()
+                    }));
+                }
+            } else if (['faction', 'faction1', 'faction2'].includes(focusedOption.name)) {
+                if (value.length === 0) {
+                    choices = storage.getAllFactionChoices();
+                } else {
+                    const tracked = storage.searchFactionByName(value);
+                    const hofResults = hof.searchHOFByName(value);
+                    
+                    const seen = new Set(tracked.map(f => f.id));
+                    const merged = [...tracked];
+                    
+                    for (const f of hofResults) {
+                        if (!seen.has(f.id)) {
+                            merged.push(f);
+                            seen.add(f.id);
+                        }
+                    }
+                    
+                    choices = merged.slice(0, 25).map(f => ({
+                        name: `${f.name} [${f.id}]`,
+                        value: f.id.toString()
+                    }));
+                }
             }
-        }
-        
-        await interaction.respond(choices.slice(0, 25));
-    },
+            
+            await interaction.respond(choices.slice(0, 25));
+        },
 
     async execute(interaction) {
         const subcommand = interaction.options.getSubcommand();
@@ -440,26 +476,51 @@ async function handleCompare(interaction) {
 // ============================================
 
 async function handleAddFactions(interaction) {
-    const idsInput = interaction.options.getString('ids');
+    const input = interaction.options.getString('factions');
     
-    const ids = idsInput.split(',')
-        .map(id => parseInt(id.trim()))
-        .filter(id => !isNaN(id));
+    await interaction.deferReply({ ephemeral: true });
     
-    if (ids.length === 0) {
-        return await interaction.reply({
-            content: '❌ No valid faction IDs provided.',
-            ephemeral: true
-        });
+    try {
+        const resolved = resolveMultipleFactions(input);
+        
+        if (resolved.length === 0) {
+            return await interaction.editReply({
+                content: '❌ No valid factions found. Use faction names or IDs.'
+            });
+        }
+        
+        const ids = resolved.map(f => f.id);
+        const result = storage.addFactionsByIds(ids);
+        
+        let response = `✅ Added **${result.added}** faction(s)`;
+        
+        if (result.skipped > 0) {
+            response += ` (${result.skipped} already tracked)`;
+        }
+        
+        if (result.added > 0 && resolved.length <= 10) {
+            response += '\n\n**Added:**\n' + resolved
+                .filter(f => !storage.loadConfig().factions.includes(f.id) || result.added === resolved.length)
+                .slice(0, result.added)
+                .map(f => `• ${f.name} [${f.id}]${f.members ? ` - ${f.members} members` : ''}`)
+                .join('\n');
+        }
+        
+        const config = storage.loadConfig();
+        const estimate = api.estimateCollectionTime(config.factions.length);
+        response += `\n\n📈 Now tracking **${config.factions.length}** factions`;
+        response += `\n⏱️ Est. collection time: **${Math.ceil(estimate / 60)}** minutes`;
+        
+        if (estimate > 14 * 60) {
+            response += `\n⚠️ Warning: Collection may not complete in 15 min. Add more API keys.`;
+        }
+        
+        await interaction.editReply({ content: response });
+        
+    } catch (error) {
+        console.error('Add factions error:', error);
+        await interaction.editReply({ content: `❌ Error: ${error.message}` });
     }
-    
-    const result = storage.addFactionsByIds(ids);
-    
-    await interaction.reply({
-        content: `✅ Added **${result.added}** faction(s)` + 
-            (result.skipped > 0 ? ` (${result.skipped} already tracked)` : ''),
-        ephemeral: true
-    });
 }
 
 async function handleAddRank(interaction) {
@@ -536,27 +597,97 @@ async function handleAddKeys(interaction) {
 }
 
 async function handleRemoveFactions(interaction) {
-    const idsInput = interaction.options.getString('ids');
+    const input = interaction.options.getString('factions');
     
-    const ids = idsInput.split(',')
-        .map(id => parseInt(id.trim()))
-        .filter(id => !isNaN(id));
+    await interaction.deferReply({ ephemeral: true });
     
-    if (ids.length === 0) {
-        return await interaction.reply({
-            content: '❌ No valid faction IDs provided.',
-            ephemeral: true
-        });
+    try {
+        const resolved = resolveMultipleFactions(input);
+        
+        if (resolved.length === 0) {
+            return await interaction.editReply({
+                content: '❌ No valid factions found. Use faction names or IDs.'
+            });
+        }
+        
+        const ids = resolved.map(f => f.id);
+        const result = storage.removeFactionsByIds(ids);
+        
+        let response = result.removed > 0
+            ? `✅ Removed **${result.removed}** faction(s)`
+            : '⚠️ No matching factions found to remove.';
+        
+        if (result.removed > 0 && resolved.length <= 10) {
+            response += '\n\n**Removed:**\n' + resolved
+                .slice(0, result.removed)
+                .map(f => `• ${f.name} [${f.id}]${f.members ? ` - ${f.members} members` : ''}`)
+                .join('\n');
+        }
+        
+        const config = storage.loadConfig();
+        response += `\n\n📈 Now tracking **${config.factions.length}** factions`;
+        
+        await interaction.editReply({ content: response });
+        
+    } catch (error) {
+        console.error('Remove factions error:', error);
+        await interaction.editReply({ content: `❌ Error: ${error.message}` });
+    }
+}
+
+
+function resolveMultipleFactions(input) {
+    const parts = input.split(',').map(p => p.trim()).filter(p => p.length > 0);
+    const resolved = [];
+    const seen = new Set();
+    
+    for (const part of parts) {
+        // Try as ID first
+        const asNumber = parseInt(part);
+        if (!isNaN(asNumber) && asNumber.toString() === part) {
+            if (!seen.has(asNumber)) {
+                // Try to get name from HOF or storage
+                const hofData = hof.getFactionFromHOF(asNumber);
+                const storageData = storage.loadFactionData(asNumber);
+                
+                resolved.push({
+                    id: asNumber,
+                    name: hofData?.name || storageData?.name || `Faction ${asNumber}`,
+                    members: hofData?.members || null
+                });
+                seen.add(asNumber);
+            }
+            continue;
+        }
+        
+        // Try as name - search HOF first, then tracked
+        const hofResults = hof.searchHOFByName(part);
+        const trackedResults = storage.searchFactionByName(part);
+        
+        // Find exact match first
+        let found = hofResults.find(f => f.name.toLowerCase() === part.toLowerCase());
+        if (!found) {
+            found = trackedResults.find(f => f.name.toLowerCase() === part.toLowerCase());
+        }
+        // If no exact match, use first result
+        if (!found && hofResults.length > 0) {
+            found = hofResults[0];
+        }
+        if (!found && trackedResults.length > 0) {
+            found = trackedResults[0];
+        }
+        
+        if (found && !seen.has(found.id)) {
+            resolved.push({
+                id: found.id,
+                name: found.name,
+                members: found.members || null
+            });
+            seen.add(found.id);
+        }
     }
     
-    const result = storage.removeFactionsByIds(ids);
-    
-    await interaction.reply({
-        content: result.removed > 0 
-            ? `✅ Removed **${result.removed}** faction(s)`
-            : '⚠️ No matching factions found to remove.',
-        ephemeral: true
-    });
+    return resolved;
 }
 
 async function handleRemoveRank(interaction) {
