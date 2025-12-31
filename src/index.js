@@ -2,6 +2,7 @@ require('dotenv').config();
 
 const { Client, GatewayIntentBits, Collection, REST, Routes } = require('discord.js');
 const collector = require('./collector');
+const db = require('./database');
 
 const activityCommand = require('./commands/activity');
 const exportCommand = require('./commands/export');
@@ -38,6 +39,9 @@ async function registerCommands() {
 
 client.once('ready', async () => {
     console.log(`Logged in as ${client.user.tag}`);
+    
+    // Initialize database
+    db.getDb();
     
     await registerCommands();
     
@@ -85,6 +89,15 @@ client.on('interactionCreate', async interaction => {
 process.on('SIGINT', () => {
     console.log('Shutting down...');
     collector.stopCollector();
+    db.closeDb();
+    client.destroy();
+    process.exit(0);
+});
+
+process.on('SIGTERM', () => {
+    console.log('Shutting down...');
+    collector.stopCollector();
+    db.closeDb();
     client.destroy();
     process.exit(0);
 });

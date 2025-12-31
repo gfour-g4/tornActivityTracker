@@ -6,16 +6,18 @@ const {
     getDayOfWeek, 
     getThirtyDaysAgo,
     getWeekId,
-    getUniqueWeeks,
     DAY_LABELS
 } = require('./utils/helpers');
 const storage = require('./utils/storage');
+const db = require('./database');
+const { heatmapCache, aggregateCache } = require('./utils/cache');
 
-// Color interpolation: Red -> Yellow -> Green
+// ============================================
+// COLOR FUNCTIONS
+// ============================================
+
 function getColor(value, min, max) {
-    if (max === min) {
-        return 'rgb(255, 255, 0)';
-    }
+    if (max === min) return 'rgb(255, 255, 0)';
     
     const ratio = Math.max(0, Math.min(1, (value - min) / (max - min)));
     
@@ -42,42 +44,18 @@ function getTextColor(value, min, max) {
 }
 
 // ============================================
-// FACTION AGGREGATION
+// FAST AGGREGATION (using pre-computed data)
 // ============================================
 
-function aggregateFactionDataHourly(factionData, dayFilter) {
+function aggregateFactionDataHourlyFast(factionId, dayFilter) {
+    const cacheKey = `faction:hourly:${factionId}:${dayFilter}`;
+    const cached = aggregateCache.get(cacheKey);
+    if (cached) return cached;
+    
     const daysToShow = parseDaysFilter(dayFilter);
-    const thirtyDaysAgo = getThirtyDaysAgo();
-    const now = Math.floor(Date.now() / 1000);
-    const snapshots = storage.getSnapshotsNormalized(factionData);
+    const aggregates = db.getHourlyAggregates(factionId, 30);
     
-    // Structure: [hour][day][weekId] = Set of member IDs
-    const hourlyData = {};
-    for (let hour = 0; hour < 24; hour++) {
-        hourlyData[hour] = {};
-        for (const day of daysToShow) {
-            hourlyData[hour][day] = {};
-        }
-    }
-    
-    for (const snapshot of snapshots) {
-        if (snapshot.timestamp < thirtyDaysAgo) continue;
-        
-        const day = getDayOfWeek(snapshot.timestamp);
-        if (!daysToShow.includes(day)) continue;
-        
-        const hour = getHourFromTimestamp(snapshot.timestamp);
-        const weekId = getWeekId(snapshot.timestamp, now);
-        
-        if (!hourlyData[hour][day][weekId]) {
-            hourlyData[hour][day][weekId] = new Set();
-        }
-        
-        for (const memberId of snapshot.active) {
-            hourlyData[hour][day][weekId].add(memberId);
-        }
-    }
-    
+    // Build result structure
     const result = {};
     let globalMin = Infinity;
     let globalMax = -Infinity;
@@ -85,67 +63,42 @@ function aggregateFactionDataHourly(factionData, dayFilter) {
     for (let hour = 0; hour < 24; hour++) {
         result[hour] = {};
         for (const day of daysToShow) {
-            const weekData = hourlyData[hour][day];
-            const weekIds = Object.keys(weekData);
-            
-            if (weekIds.length === 0) {
-                result[hour][day] = 0;
-            } else {
-                let total = 0;
-                for (const weekId of weekIds) {
-                    total += weekData[weekId].size;
-                }
-                result[hour][day] = Math.round(total / weekIds.length * 10) / 10;
-            }
-            
-            if (result[hour][day] < globalMin) globalMin = result[hour][day];
-            if (result[hour][day] > globalMax) globalMax = result[hour][day];
+            result[hour][day] = 0;
         }
     }
     
-    return { 
+    // Fill with aggregate data
+    for (const row of aggregates) {
+        if (!daysToShow.includes(row.day_of_week)) continue;
+        
+        const avg = row.total_snapshots > 0 
+            ? Math.round(row.total_active / row.total_snapshots * 10) / 10 
+            : 0;
+        
+        result[row.hour][row.day_of_week] = avg;
+        
+        if (avg < globalMin) globalMin = avg;
+        if (avg > globalMax) globalMax = avg;
+    }
+    
+    const output = { 
         data: result, 
         min: globalMin === Infinity ? 0 : globalMin, 
         max: globalMax === -Infinity ? 0 : globalMax, 
         days: daysToShow 
     };
+    
+    aggregateCache.set(cacheKey, output);
+    return output;
 }
 
-function aggregateFactionData15Min(factionData, dayFilter) {
+function aggregateFactionData15MinFast(factionId, dayFilter) {
+    const cacheKey = `faction:15min:${factionId}:${dayFilter}`;
+    const cached = aggregateCache.get(cacheKey);
+    if (cached) return cached;
+    
     const daysToShow = parseDaysFilter(dayFilter);
-    const thirtyDaysAgo = getThirtyDaysAgo();
-    const now = Math.floor(Date.now() / 1000);
-    const snapshots = storage.getSnapshotsNormalized(factionData);
-    
-    // Structure: [hour][day][slot][weekId] = Set of member IDs
-    const data = {};
-    for (let hour = 0; hour < 24; hour++) {
-        data[hour] = {};
-        for (const day of daysToShow) {
-            data[hour][day] = {
-                0: {}, 1: {}, 2: {}, 3: {}
-            };
-        }
-    }
-    
-    for (const snapshot of snapshots) {
-        if (snapshot.timestamp < thirtyDaysAgo) continue;
-        
-        const day = getDayOfWeek(snapshot.timestamp);
-        if (!daysToShow.includes(day)) continue;
-        
-        const hour = getHourFromTimestamp(snapshot.timestamp);
-        const slot = get15MinSlotInHour(snapshot.timestamp);
-        const weekId = getWeekId(snapshot.timestamp, now);
-        
-        if (!data[hour][day][slot][weekId]) {
-            data[hour][day][slot][weekId] = new Set();
-        }
-        
-        for (const memberId of snapshot.active) {
-            data[hour][day][slot][weekId].add(memberId);
-        }
-    }
+    const aggregates = db.get15MinAggregates(factionId, 30);
     
     const result = {};
     let globalMin = Infinity;
@@ -154,85 +107,73 @@ function aggregateFactionData15Min(factionData, dayFilter) {
     for (let hour = 0; hour < 24; hour++) {
         result[hour] = {};
         for (const day of daysToShow) {
-            result[hour][day] = [];
-            
-            for (let slot = 0; slot < 4; slot++) {
-                const weekData = data[hour][day][slot];
-                const weekIds = Object.keys(weekData);
-                
-                let avg = 0;
-                if (weekIds.length > 0) {
-                    let total = 0;
-                    for (const weekId of weekIds) {
-                        total += weekData[weekId].size;
-                    }
-                    avg = Math.round(total / weekIds.length * 10) / 10;
-                }
-                
-                result[hour][day].push(avg);
-                
-                if (avg < globalMin) globalMin = avg;
-                if (avg > globalMax) globalMax = avg;
-            }
+            result[hour][day] = [0, 0, 0, 0];
         }
     }
     
-    return { 
+    for (const row of aggregates) {
+        if (!daysToShow.includes(row.day_of_week)) continue;
+        
+        const avg = row.total_snapshots > 0 
+            ? Math.round(row.total_active / row.total_snapshots * 10) / 10 
+            : 0;
+        
+        result[row.hour][row.day_of_week][row.slot] = avg;
+        
+        if (avg < globalMin) globalMin = avg;
+        if (avg > globalMax) globalMax = avg;
+    }
+    
+    const output = { 
         data: result, 
         min: globalMin === Infinity ? 0 : globalMin, 
         max: globalMax === -Infinity ? 0 : globalMax, 
         days: daysToShow,
         is15Min: true
     };
+    
+    aggregateCache.set(cacheKey, output);
+    return output;
 }
 
 // ============================================
-// USER AGGREGATION (MULTI-FACTION)
+// USER AGGREGATION (needs raw snapshots)
 // ============================================
 
 function aggregateUserDataHourlyMultiFaction(userId, dayFilter) {
+    const cacheKey = `user:hourly:${userId}:${dayFilter}`;
+    const cached = aggregateCache.get(cacheKey);
+    if (cached) return cached;
+    
     const daysToShow = parseDaysFilter(dayFilter);
     const thirtyDaysAgo = getThirtyDaysAgo();
     const now = Math.floor(Date.now() / 1000);
     
-    // Find all factions user has been in
     const factionIds = storage.findUserInAllFactions(userId);
     
-    if (factionIds.length === 0) {
-        return null;
-    }
+    if (factionIds.length === 0) return null;
     
-    // Aggregate across all factions
     const hourlyData = {};
     for (let hour = 0; hour < 24; hour++) {
         hourlyData[hour] = {};
         for (const day of daysToShow) {
-            hourlyData[hour][day] = {
-                weeksWithData: new Set(),
-                weeksActive: new Set()
-            };
+            hourlyData[hour][day] = { weeksWithData: new Set(), weeksActive: new Set() };
         }
     }
     
     for (const factionId of factionIds) {
-        const factionData = storage.loadFactionData(factionId);
-        const snapshots = storage.getSnapshotsNormalized(factionData);
+        const snapshots = db.getSnapshotsNormalized(factionId, thirtyDaysAgo);
         
         for (const snapshot of snapshots) {
-            if (snapshot.timestamp < thirtyDaysAgo) continue;
-            
             const day = getDayOfWeek(snapshot.timestamp);
             if (!daysToShow.includes(day)) continue;
             
             const hour = getHourFromTimestamp(snapshot.timestamp);
-            const weekId = getWeekId(snapshot.timestamp, now);
+            const weekId = `${factionId}-${getWeekId(snapshot.timestamp, now)}`;
             
-            // Create unique week key to avoid double counting
-            const weekKey = `${factionId}-${weekId}`;
-            hourlyData[hour][day].weeksWithData.add(weekKey);
-            
+            hourlyData[hour][day].weeksWithData.add(weekId);
             if (snapshot.active.includes(userId)) {
-                hourlyData[hour][day].weeksActive.add(weekKey);
+                hourlyData[hour][day].weeksActive.add(weekId);
             }
         }
     }
@@ -243,16 +184,13 @@ function aggregateUserDataHourlyMultiFaction(userId, dayFilter) {
         result[hour] = {};
         for (const day of daysToShow) {
             const { weeksWithData, weeksActive } = hourlyData[hour][day];
-            
-            if (weeksWithData.size === 0) {
-                result[hour][day] = 0;
-            } else {
-                result[hour][day] = Math.round((weeksActive.size / weeksWithData.size) * 100);
-            }
+            result[hour][day] = weeksWithData.size === 0 
+                ? 0 
+                : Math.round((weeksActive.size / weeksWithData.size) * 100);
         }
     }
     
-    return { 
+    const output = { 
         data: result, 
         min: 0, 
         max: 100, 
@@ -260,46 +198,45 @@ function aggregateUserDataHourlyMultiFaction(userId, dayFilter) {
         isPercentage: true,
         factionIds
     };
+    
+    aggregateCache.set(cacheKey, output);
+    return output;
 }
 
 function aggregateUserData15MinMultiFaction(userId, dayFilter) {
+    const cacheKey = `user:15min:${userId}:${dayFilter}`;
+    const cached = aggregateCache.get(cacheKey);
+    if (cached) return cached;
+    
     const daysToShow = parseDaysFilter(dayFilter);
     const thirtyDaysAgo = getThirtyDaysAgo();
     
     const factionIds = storage.findUserInAllFactions(userId);
     
-    if (factionIds.length === 0) {
-        return null;
-    }
+    if (factionIds.length === 0) return null;
     
-    // Structure: [hour][day][slot] = { total: 0, active: 0 }
     const data = {};
     for (let hour = 0; hour < 24; hour++) {
         data[hour] = {};
         for (const day of daysToShow) {
-            data[hour][day] = {
-                0: { total: 0, active: 0 },
-                1: { total: 0, active: 0 },
-                2: { total: 0, active: 0 },
-                3: { total: 0, active: 0 }
-            };
+            data[hour][day] = [
+                { total: 0, active: 0 },
+                { total: 0, active: 0 },
+                { total: 0, active: 0 },
+                { total: 0, active: 0 }
+            ];
         }
     }
     
-    // Track processed snapshots to avoid double counting
     const processedSnapshots = new Set();
     
     for (const factionId of factionIds) {
-        const factionData = storage.loadFactionData(factionId);
-        const snapshots = storage.getSnapshotsNormalized(factionData);
+        const snapshots = db.getSnapshotsNormalized(factionId, thirtyDaysAgo);
         
         for (const snapshot of snapshots) {
-            if (snapshot.timestamp < thirtyDaysAgo) continue;
-            
-            // Unique key for this snapshot
-            const snapshotKey = `${snapshot.timestamp}`;
-            if (processedSnapshots.has(snapshotKey)) continue;
-            processedSnapshots.add(snapshotKey);
+            const key = snapshot.timestamp.toString();
+            if (processedSnapshots.has(key)) continue;
+            processedSnapshots.add(key);
             
             const day = getDayOfWeek(snapshot.timestamp);
             if (!daysToShow.includes(day)) continue;
@@ -308,7 +245,6 @@ function aggregateUserData15MinMultiFaction(userId, dayFilter) {
             const slot = get15MinSlotInHour(snapshot.timestamp);
             
             data[hour][day][slot].total++;
-            
             if (snapshot.active.includes(userId)) {
                 data[hour][day][slot].active++;
             }
@@ -321,20 +257,14 @@ function aggregateUserData15MinMultiFaction(userId, dayFilter) {
         result[hour] = {};
         for (const day of daysToShow) {
             result[hour][day] = [];
-            
             for (let slot = 0; slot < 4; slot++) {
                 const { total, active } = data[hour][day][slot];
-                
-                if (total === 0) {
-                    result[hour][day].push(0);
-                } else {
-                    result[hour][day].push(Math.round((active / total) * 100));
-                }
+                result[hour][day].push(total === 0 ? 0 : Math.round((active / total) * 100));
             }
         }
     }
     
-    return { 
+    const output = { 
         data: result, 
         min: 0, 
         max: 100, 
@@ -343,6 +273,9 @@ function aggregateUserData15MinMultiFaction(userId, dayFilter) {
         isPercentage: true,
         factionIds
     };
+    
+    aggregateCache.set(cacheKey, output);
+    return output;
 }
 
 // ============================================
@@ -414,12 +347,9 @@ function generateHeatmapImage(title, aggregatedData, subtitle = '') {
             ctx.textAlign = 'center';
             ctx.font = '12px Arial';
             
-            let displayValue;
-            if (isPercentage) {
-                displayValue = `${Math.round(value)}%`;
-            } else {
-                displayValue = Number.isInteger(value) ? value.toString() : value.toFixed(1);
-            }
+            const displayValue = isPercentage 
+                ? `${Math.round(value)}%` 
+                : (Number.isInteger(value) ? value.toString() : value.toFixed(1));
             ctx.fillText(displayValue, x + cellWidth / 2, y + cellHeight / 2 + 4);
         });
     }
@@ -517,12 +447,7 @@ function generateCompact15MinImage(title, aggregatedData, subtitle = '') {
                 ctx.textAlign = 'center';
                 ctx.font = '9px Arial';
                 
-                let displayVal;
-                if (isPercentage) {
-                    displayVal = Math.round(val).toString();
-                } else {
-                    displayVal = Math.round(val).toString();
-                }
+                const displayVal = isPercentage ? Math.round(val).toString() : Math.round(val).toString();
                 ctx.fillText(displayVal, subX + subWidth / 2, y + cellHeight / 2 + 3);
             }
         });
@@ -778,31 +703,42 @@ function generateDifferenceImage(title1, data1, title2, data2) {
 }
 
 // ============================================
-// PUBLIC API
+// PUBLIC API (with caching)
 // ============================================
 
 async function createFactionHeatmap(factionId, granularity, dayFilter) {
-    const factionData = storage.loadFactionData(factionId);
-    const snapshots = storage.getSnapshotsNormalized(factionData);
+    const cacheKey = `img:faction:${factionId}:${granularity}:${dayFilter}`;
+    const cached = heatmapCache.get(cacheKey);
+    if (cached) return cached;
     
-    if (!snapshots || snapshots.length === 0) {
+    const faction = db.getFaction(factionId);
+    
+    if (!faction) {
         throw new Error(`No data available for faction ${factionId}. Wait for data collection.`);
     }
     
-    const title = `${factionData.name || 'Faction'} [${factionId}]`;
-    const numWeeks = getUniqueWeeks(snapshots, Math.floor(Date.now() / 1000));
-    const subtitle = `Last 30 days (${numWeeks} week${numWeeks !== 1 ? 's' : ''} of data) - Avg unique active per hour`;
+    const title = `${faction.name || 'Faction'} [${factionId}]`;
+    const numWeeks = db.getWeekCount(factionId);
+    const subtitle = `Last 30 days (${numWeeks} week${numWeeks !== 1 ? 's' : ''} of data) - Avg active per hour`;
     
+    let buffer;
     if (granularity === '15min') {
-        const aggregated = aggregateFactionData15Min(factionData, dayFilter);
-        return generateCompact15MinImage(title, aggregated, subtitle);
+        const aggregated = aggregateFactionData15MinFast(factionId, dayFilter);
+        buffer = generateCompact15MinImage(title, aggregated, subtitle);
     } else {
-        const aggregated = aggregateFactionDataHourly(factionData, dayFilter);
-        return generateHeatmapImage(title, aggregated, subtitle);
+        const aggregated = aggregateFactionDataHourlyFast(factionId, dayFilter);
+        buffer = generateHeatmapImage(title, aggregated, subtitle);
     }
+    
+    heatmapCache.set(cacheKey, buffer);
+    return buffer;
 }
 
 async function createUserHeatmap(userId, granularity, dayFilter) {
+    const cacheKey = `img:user:${userId}:${granularity}:${dayFilter}`;
+    const cached = heatmapCache.get(cacheKey);
+    if (cached) return cached;
+    
     let aggregated;
     
     if (granularity === '15min') {
@@ -815,59 +751,58 @@ async function createUserHeatmap(userId, granularity, dayFilter) {
         throw new Error(`User ${userId} not found in any tracked faction.`);
     }
     
-    // Get username
-    const userName = storage.getMemberName(userId) || `User`;
+    const userName = storage.getMemberName(userId) || 'User';
     const title = `${userName} [${userId}]`;
     
-    // Calculate data span
-    const factionData = storage.loadFactionData(aggregated.factionIds[0]);
-    const snapshots = storage.getSnapshotsNormalized(factionData);
-    const numWeeks = getUniqueWeeks(snapshots, Math.floor(Date.now() / 1000));
+    const numWeeks = aggregated.factionIds.length > 0 ? db.getWeekCount(aggregated.factionIds[0]) : 0;
     
     const factionInfo = aggregated.factionIds.length > 1 
         ? `across ${aggregated.factionIds.length} factions` 
         : '';
-    const subtitle = `Last 30 days (${numWeeks} week${numWeeks !== 1 ? 's' : ''}) - % of time active ${factionInfo}`;
+    const subtitle = `Last 30 days (${numWeeks} week${numWeeks !== 1 ? 's' : ''}) - % active ${factionInfo}`;
     
+    let buffer;
     if (granularity === '15min') {
-        return generateCompact15MinImage(title, aggregated, subtitle);
+        buffer = generateCompact15MinImage(title, aggregated, subtitle);
     } else {
-        return generateHeatmapImage(title, aggregated, subtitle);
+        buffer = generateHeatmapImage(title, aggregated, subtitle);
     }
+    
+    heatmapCache.set(cacheKey, buffer);
+    return buffer;
 }
 
 async function createComparisonHeatmaps(faction1Id, faction2Id, granularity, dayFilter) {
-    const faction1Data = storage.loadFactionData(faction1Id);
-    const faction2Data = storage.loadFactionData(faction2Id);
+    const cacheKey = `img:compare:${faction1Id}:${faction2Id}:${granularity}:${dayFilter}`;
+    const cached = heatmapCache.get(cacheKey);
+    if (cached) return cached;
     
-    const snapshots1 = storage.getSnapshotsNormalized(faction1Data);
-    const snapshots2 = storage.getSnapshotsNormalized(faction2Data);
+    const faction1 = db.getFaction(faction1Id);
+    const faction2 = db.getFaction(faction2Id);
     
-    if (!snapshots1?.length) {
-        throw new Error(`No data available for faction ${faction1Id}.`);
-    }
+    if (!faction1) throw new Error(`No data available for faction ${faction1Id}.`);
+    if (!faction2) throw new Error(`No data available for faction ${faction2Id}.`);
     
-    if (!snapshots2?.length) {
-        throw new Error(`No data available for faction ${faction2Id}.`);
-    }
-    
-    const name1 = faction1Data.name || `Faction ${faction1Id}`;
-    const name2 = faction2Data.name || `Faction ${faction2Id}`;
+    const name1 = faction1.name || `Faction ${faction1Id}`;
+    const name2 = faction2.name || `Faction ${faction2Id}`;
     
     let agg1, agg2;
     
     if (granularity === '15min') {
-        agg1 = aggregateFactionData15Min(faction1Data, dayFilter);
-        agg2 = aggregateFactionData15Min(faction2Data, dayFilter);
+        agg1 = aggregateFactionData15MinFast(faction1Id, dayFilter);
+        agg2 = aggregateFactionData15MinFast(faction2Id, dayFilter);
     } else {
-        agg1 = aggregateFactionDataHourly(faction1Data, dayFilter);
-        agg2 = aggregateFactionDataHourly(faction2Data, dayFilter);
+        agg1 = aggregateFactionDataHourlyFast(faction1Id, dayFilter);
+        agg2 = aggregateFactionDataHourlyFast(faction2Id, dayFilter);
     }
     
     const sideBySide = generateComparisonImage(name1, agg1, name2, agg2);
     const difference = generateDifferenceImage(name1, agg1, name2, agg2);
     
-    return { sideBySide, difference };
+    const result = { sideBySide, difference };
+    heatmapCache.set(cacheKey, result);
+    
+    return result;
 }
 
 module.exports = {

@@ -1,0 +1,4360 @@
+================================================================================
+EXPORTED FILES FOR AI CHATBOT
+Export Date: 12/31/2025, 11:28:21 PM
+Total Files: 10
+================================================================================
+
+File: package.json
+----------------------------------------
+{
+    "name": "torn-activity-bot",
+    "version": "1.0.0",
+    "description": "Discord bot to track Torn faction member activity",
+    "main": "src/index.js",
+    "scripts": {
+      "start": "node src/index.js",
+      "dev": "node --watch src/index.js",
+      "generate-test-data": "node generate-test-data.js"
+    },
+    "dependencies": {
+      "canvas": "^2.11.2",
+      "discord.js": "^14.14.1",
+      "dotenv": "^16.3.1"
+    },
+    "engines": {
+      "node": ">=18.0.0"
+    }
+  }
+
+================================================================================
+
+File: src/collector.js
+----------------------------------------
+const api = require('./utils/api');
+const storage = require('./utils/storage');
+const hof = require('./utils/hof');
+
+let collectorInterval = null;
+let hofInterval = null;
+let isCollecting = false;
+let lastCollectionStats = null;
+
+const COLLECTION_INTERVAL = 15 * 60 * 1000; // 15 minutes
+const HOF_UPDATE_INTERVAL = 7 * 24 * 60 * 60 * 1000; // 7 days
+
+async function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function collectFactionData(factionId) {
+    try {
+        const pollTimestamp = Math.floor(Date.now() / 1000);
+        const factionData = await api.fetchFaction(factionId);
+        const { active, total, allMemberIds, members } = api.processActivitySnapshot(factionData, pollTimestamp);
+        
+        storage.updateMemberNames(members);
+        
+        storage.addSnapshot(
+            factionId, 
+            factionData.name, 
+            pollTimestamp, 
+            active, 
+            total,
+            allMemberIds
+        );
+        
+        return { success: true, factionId, name: factionData.name, active: active.length, total };
+    } catch (error) {
+        return { success: false, factionId, error: error.message };
+    }
+}
+
+async function collectAllFactions() {
+    if (isCollecting) {
+        console.log('[Collector] Collection already in progress, skipping...');
+        return null;
+    }
+    
+    isCollecting = true;
+    
+    const config = storage.loadConfig();
+    
+    if (config.factions.length === 0) {
+        console.log('[Collector] No factions configured to track.');
+        isCollecting = false;
+        return null;
+    }
+    
+    if (config.apikeys.length === 0) {
+        console.log('[Collector] No API keys configured.');
+        isCollecting = false;
+        return null;
+    }
+    
+    const startTime = Date.now();
+    const estimatedTime = api.estimateCollectionTime(config.factions.length);
+    
+    console.log(`[${new Date().toISOString()}] Starting collection...`);
+    console.log(`  Factions: ${config.factions.length}`);
+    console.log(`  API Keys: ${config.apikeys.length}`);
+    console.log(`  Estimated time: ${Math.ceil(estimatedTime / 60)} minutes`);
+    
+    const results = {
+        success: 0,
+        failed: 0,
+        errors: [],
+        startTime,
+        endTime: null
+    };
+    
+    let processedCount = 0;
+    
+    for (const factionId of config.factions) {
+        const result = await collectFactionData(factionId);
+        processedCount++;
+        
+        if (result.success) {
+            results.success++;
+            if (config.factions.length <= 20 || processedCount % 50 === 0) {
+                console.log(`  [${processedCount}/${config.factions.length}] ✓ ${result.name}: ${result.active}/${result.total} active`);
+            }
+        } else {
+            results.failed++;
+            results.errors.push({ factionId, error: result.error });
+            console.log(`  [${processedCount}/${config.factions.length}] ✗ Faction ${factionId}: ${result.error}`);
+        }
+        
+        await sleep(100);
+    }
+    
+    results.endTime = Date.now();
+    const duration = (results.endTime - results.startTime) / 1000;
+    
+    console.log(`[${new Date().toISOString()}] Collection complete!`);
+    console.log(`  Success: ${results.success}/${config.factions.length}`);
+    console.log(`  Failed: ${results.failed}`);
+    console.log(`  Duration: ${Math.floor(duration / 60)}m ${Math.floor(duration % 60)}s`);
+    
+    lastCollectionStats = results;
+    isCollecting = false;
+    
+    return results;
+}
+
+async function updateHOFIfNeeded() {
+    if (hof.isHOFCacheStale()) {
+        console.log('[Collector] HOF cache is stale, updating...');
+        try {
+            await hof.updateHOFCache();
+        } catch (error) {
+            console.error('[Collector] Failed to update HOF cache:', error.message);
+        }
+    }
+}
+
+function startCollector() {
+    if (collectorInterval) {
+        console.log('[Collector] Already running.');
+        return;
+    }
+    
+    const config = storage.loadConfig();
+    console.log(`[Collector] Starting...`);
+    console.log(`  Tracking ${config.factions.length} factions`);
+    console.log(`  Using ${config.apikeys.length} API keys`);
+    console.log(`  Collection interval: 15 minutes`);
+    
+    // Update HOF on startup if needed
+    updateHOFIfNeeded();
+    
+    // Collect immediately on start
+    collectAllFactions();
+    
+    // Then every 15 minutes
+    collectorInterval = setInterval(collectAllFactions, COLLECTION_INTERVAL);
+    
+    // Check HOF daily
+    hofInterval = setInterval(updateHOFIfNeeded, 24 * 60 * 60 * 1000);
+}
+
+function stopCollector() {
+    if (collectorInterval) {
+        clearInterval(collectorInterval);
+        collectorInterval = null;
+    }
+    
+    if (hofInterval) {
+        clearInterval(hofInterval);
+        hofInterval = null;
+    }
+    
+    console.log('[Collector] Stopped.');
+}
+
+function getCollectorStatus() {
+    const config = storage.loadConfig();
+    
+    return {
+        running: collectorInterval !== null,
+        collecting: isCollecting,
+        factionCount: config.factions.length,
+        keyCount: config.apikeys.length,
+        rateLimit: api.RATE_LIMIT_PER_KEY,
+        estimatedCollectionTime: api.estimateCollectionTime(config.factions.length),
+        lastCollection: lastCollectionStats,
+        rateLimitStatus: api.getRateLimitStatus()
+    };
+}
+
+module.exports = {
+    startCollector,
+    stopCollector,
+    collectAllFactions,
+    collectFactionData,
+    getCollectorStatus
+};
+
+================================================================================
+
+File: src/commands/activity.js
+----------------------------------------
+const { SlashCommandBuilder, AttachmentBuilder, PermissionFlagsBits } = require('discord.js');
+const heatmap = require('../heatmap');
+const storage = require('../utils/storage');
+const hof = require('../utils/hof');
+const api = require('../utils/api');
+const collector = require('../collector');
+
+const GRANULARITY_CHOICES = [
+    { name: 'Hourly', value: 'hourly' },
+    { name: '15 Minutes', value: '15min' }
+];
+
+const RANK_CHOICES = [
+    { name: 'Platinum', value: 'platinum' },
+    { name: 'Diamond', value: 'diamond' }
+];
+
+module.exports = {
+    data: new SlashCommandBuilder()
+        .setName('activity')
+        .setDescription('Activity tracking and management')
+        // Heatmap subcommands
+        .addSubcommand(subcommand =>
+            subcommand
+                .setName('faction')
+                .setDescription('View faction activity heatmap')
+                .addStringOption(option =>
+                    option
+                        .setName('faction')
+                        .setDescription('Faction name or ID')
+                        .setRequired(true)
+                        .setAutocomplete(true)
+                )
+                .addStringOption(option =>
+                    option
+                        .setName('granularity')
+                        .setDescription('Time granularity')
+                        .addChoices(...GRANULARITY_CHOICES)
+                )
+                .addStringOption(option =>
+                    option
+                        .setName('days')
+                        .setDescription('Days to include (all, weekday, weekend, or: mon,tue,wed)')
+                )
+        )
+        .addSubcommand(subcommand =>
+            subcommand
+                .setName('user')
+                .setDescription('View user activity heatmap')
+                .addStringOption(option =>
+                    option
+                        .setName('user')
+                        .setDescription('Username or ID')
+                        .setRequired(true)
+                        .setAutocomplete(true)
+                )
+                .addStringOption(option =>
+                    option
+                        .setName('granularity')
+                        .setDescription('Time granularity')
+                        .addChoices(...GRANULARITY_CHOICES)
+                )
+                .addStringOption(option =>
+                    option
+                        .setName('days')
+                        .setDescription('Days to include (all, weekday, weekend, or: mon,tue,wed)')
+                )
+        )
+        .addSubcommand(subcommand =>
+            subcommand
+                .setName('compare')
+                .setDescription('Compare two factions')
+                .addStringOption(option =>
+                    option
+                        .setName('faction1')
+                        .setDescription('First faction name or ID')
+                        .setRequired(true)
+                        .setAutocomplete(true)
+                )
+                .addStringOption(option =>
+                    option
+                        .setName('faction2')
+                        .setDescription('Second faction name or ID')
+                        .setRequired(true)
+                        .setAutocomplete(true)
+                )
+                .addStringOption(option =>
+                    option
+                        .setName('granularity')
+                        .setDescription('Time granularity')
+                        .addChoices(...GRANULARITY_CHOICES)
+                )
+                .addStringOption(option =>
+                    option
+                        .setName('days')
+                        .setDescription('Days to include')
+                )
+        )
+        // Management subcommands
+        .addSubcommand(subcommand =>
+            subcommand
+                .setName('add-factions')
+                .setDescription('Add factions to track')
+                .addStringOption(option =>
+                    option
+                        .setName('factions')
+                        .setDescription('Faction names or IDs (comma-separated)')
+                        .setRequired(true)
+                        .setAutocomplete(true)
+                )
+        )
+        .addSubcommand(subcommand =>
+            subcommand
+                .setName('add-rank')
+                .setDescription('Add all factions of a certain rank')
+                .addStringOption(option =>
+                    option
+                        .setName('rank')
+                        .setDescription('Faction rank')
+                        .setRequired(true)
+                        .addChoices(...RANK_CHOICES)
+                )
+                .addIntegerOption(option =>
+                    option
+                        .setName('min-members')
+                        .setDescription('Minimum member count')
+                        .setMinValue(1)
+                        .setMaxValue(100)
+                )
+                .addIntegerOption(option =>
+                    option
+                        .setName('max-members')
+                        .setDescription('Maximum member count')
+                        .setMinValue(1)
+                        .setMaxValue(100)
+                )
+        )
+        .addSubcommand(subcommand =>
+            subcommand
+                .setName('add-keys')
+                .setDescription('Add API keys')
+                .addStringOption(option =>
+                    option
+                        .setName('keys')
+                        .setDescription('Comma-separated API keys')
+                        .setRequired(true)
+                )
+        )
+        .addSubcommand(subcommand =>
+            subcommand
+                .setName('remove-factions')
+                .setDescription('Remove factions from tracking')
+                .addStringOption(option =>
+                    option
+                        .setName('factions')
+                        .setDescription('Faction names or IDs (comma-separated)')
+                        .setRequired(true)
+                        .setAutocomplete(true)
+                )
+        )
+        .addSubcommand(subcommand =>
+            subcommand
+                .setName('remove-rank')
+                .setDescription('Remove all factions of a certain rank')
+                .addStringOption(option =>
+                    option
+                        .setName('rank')
+                        .setDescription('Faction rank')
+                        .setRequired(true)
+                        .addChoices(...RANK_CHOICES)
+                )
+                .addIntegerOption(option =>
+                    option
+                        .setName('min-members')
+                        .setDescription('Minimum member count')
+                        .setMinValue(1)
+                        .setMaxValue(100)
+                )
+                .addIntegerOption(option =>
+                    option
+                        .setName('max-members')
+                        .setDescription('Maximum member count')
+                        .setMinValue(1)
+                        .setMaxValue(100)
+                )
+        )
+        .addSubcommand(subcommand =>
+            subcommand
+                .setName('remove-key')
+                .setDescription('Remove an API key')
+                .addStringOption(option =>
+                    option
+                        .setName('key')
+                        .setDescription('API key to remove')
+                        .setRequired(true)
+                )
+        )
+        .addSubcommand(subcommand =>
+            subcommand
+                .setName('list')
+                .setDescription('Show current configuration')
+        )
+        .addSubcommand(subcommand =>
+            subcommand
+                .setName('status')
+                .setDescription('Show collector status and rate limits')
+        )
+        .addSubcommand(subcommand =>
+            subcommand
+                .setName('collect')
+                .setDescription('Manually trigger data collection')
+        )
+        .addSubcommand(subcommand =>
+            subcommand
+                .setName('refresh-hof')
+                .setDescription('Manually refresh the faction Hall of Fame cache')
+        ),
+
+        async autocomplete(interaction) {
+            const focusedOption = interaction.options.getFocused(true);
+            const value = focusedOption.value;
+            const subcommand = interaction.options.getSubcommand();
+            
+            let choices = [];
+            
+            if (focusedOption.name === 'user') {
+                if (value.length === 0) {
+                    choices = storage.getAllMemberChoices();
+                } else {
+                    choices = storage.searchMemberByName(value).map(m => ({
+                        name: `${m.name} [${m.id}]`,
+                        value: m.id.toString()
+                    }));
+                }
+            } else if (focusedOption.name === 'factions') {
+                // For add-factions and remove-factions
+                // Get the last item being typed (after last comma)
+                const parts = value.split(',');
+                const current = parts[parts.length - 1].trim();
+                const prefix = parts.slice(0, -1).join(',');
+                
+                if (current.length === 0) {
+                    // Show HOF factions
+                    const hofFactions = hof.loadHOFCache().factions.slice(0, 25);
+                    choices = hofFactions.map(f => ({
+                        name: `${f.name} [${f.id}]`,
+                        value: prefix ? `${prefix},${f.id}` : f.id.toString()
+                    }));
+                } else {
+                    // Search HOF and tracked factions
+                    const hofResults = hof.searchHOFByName(current);
+                    const trackedResults = storage.searchFactionByName(current);
+                    
+                    // Merge results
+                    const seen = new Set();
+                    const merged = [];
+                    
+                    for (const f of [...trackedResults, ...hofResults]) {
+                        if (!seen.has(f.id)) {
+                            merged.push(f);
+                            seen.add(f.id);
+                        }
+                    }
+                    
+                    choices = merged.slice(0, 25).map(f => ({
+                        name: `${f.name} [${f.id}]`,
+                        value: prefix ? `${prefix},${f.id}` : f.id.toString()
+                    }));
+                }
+            } else if (['faction', 'faction1', 'faction2'].includes(focusedOption.name)) {
+                if (value.length === 0) {
+                    choices = storage.getAllFactionChoices();
+                } else {
+                    const tracked = storage.searchFactionByName(value);
+                    const hofResults = hof.searchHOFByName(value);
+                    
+                    const seen = new Set(tracked.map(f => f.id));
+                    const merged = [...tracked];
+                    
+                    for (const f of hofResults) {
+                        if (!seen.has(f.id)) {
+                            merged.push(f);
+                            seen.add(f.id);
+                        }
+                    }
+                    
+                    choices = merged.slice(0, 25).map(f => ({
+                        name: `${f.name} [${f.id}]`,
+                        value: f.id.toString()
+                    }));
+                }
+            }
+            
+            await interaction.respond(choices.slice(0, 25));
+        },
+
+    async execute(interaction) {
+        const subcommand = interaction.options.getSubcommand();
+
+        // Heatmap commands
+        if (subcommand === 'faction') {
+            return await handleFactionHeatmap(interaction);
+        }
+        
+        if (subcommand === 'user') {
+            return await handleUserHeatmap(interaction);
+        }
+        
+        if (subcommand === 'compare') {
+            return await handleCompare(interaction);
+        }
+        
+        // Management commands (admin only)
+        const adminCommands = ['add-factions', 'add-rank', 'add-keys', 'remove-factions', 'remove-rank', 'remove-key', 'collect', 'refresh-hof'];
+        
+        if (adminCommands.includes(subcommand)) {
+            if (!interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)) {
+                return await interaction.reply({
+                    content: '❌ This command requires Administrator permissions.',
+                    ephemeral: true
+                });
+            }
+        }
+        
+        if (subcommand === 'add-factions') {
+            return await handleAddFactions(interaction);
+        }
+        
+        if (subcommand === 'add-rank') {
+            return await handleAddRank(interaction);
+        }
+        
+        if (subcommand === 'add-keys') {
+            return await handleAddKeys(interaction);
+        }
+        
+        if (subcommand === 'remove-factions') {
+            return await handleRemoveFactions(interaction);
+        }
+        
+        if (subcommand === 'remove-rank') {
+            return await handleRemoveRank(interaction);
+        }
+        
+        if (subcommand === 'remove-key') {
+            return await handleRemoveKey(interaction);
+        }
+        
+        if (subcommand === 'list') {
+            return await handleList(interaction);
+        }
+        
+        if (subcommand === 'status') {
+            return await handleStatus(interaction);
+        }
+        
+        if (subcommand === 'collect') {
+            return await handleCollect(interaction);
+        }
+        
+        if (subcommand === 'refresh-hof') {
+            return await handleRefreshHOF(interaction);
+        }
+    }
+};
+
+// ============================================
+// HEATMAP HANDLERS
+// ============================================
+
+async function handleFactionHeatmap(interaction) {
+    const input = interaction.options.getString('faction');
+    const granularity = interaction.options.getString('granularity') || 'hourly';
+    const days = interaction.options.getString('days') || 'all';
+    
+    await interaction.deferReply();
+    
+    try {
+        const faction = storage.resolveFaction(input);
+        
+        if (!faction) {
+            return await interaction.editReply({
+                content: `❌ Faction not found: "${input}"\nUse a faction name or ID from the tracked list.`
+            });
+        }
+        
+        const imageBuffer = await heatmap.createFactionHeatmap(faction.id, granularity, days);
+        
+        const attachment = new AttachmentBuilder(imageBuffer, { 
+            name: `faction_${faction.id}_activity.png` 
+        });
+        
+        await interaction.editReply({ files: [attachment] });
+        
+    } catch (error) {
+        console.error('Faction heatmap error:', error);
+        await interaction.editReply({ content: `❌ Error: ${error.message}` });
+    }
+}
+
+async function handleUserHeatmap(interaction) {
+    const input = interaction.options.getString('user');
+    const granularity = interaction.options.getString('granularity') || 'hourly';
+    const days = interaction.options.getString('days') || 'all';
+    
+    await interaction.deferReply();
+    
+    try {
+        const member = storage.resolveMember(input);
+        
+        if (!member) {
+            return await interaction.editReply({
+                content: `❌ User not found: "${input}"\nThe user must have been active in a tracked faction.`
+            });
+        }
+        
+        const imageBuffer = await heatmap.createUserHeatmap(member.id, granularity, days);
+        
+        const attachment = new AttachmentBuilder(imageBuffer, { 
+            name: `user_${member.id}_activity.png` 
+        });
+        
+        await interaction.editReply({ files: [attachment] });
+        
+    } catch (error) {
+        console.error('User heatmap error:', error);
+        await interaction.editReply({ content: `❌ Error: ${error.message}` });
+    }
+}
+
+async function handleCompare(interaction) {
+    const input1 = interaction.options.getString('faction1');
+    const input2 = interaction.options.getString('faction2');
+    const granularity = interaction.options.getString('granularity') || 'hourly';
+    const days = interaction.options.getString('days') || 'all';
+    
+    await interaction.deferReply();
+    
+    try {
+        const faction1 = storage.resolveFaction(input1);
+        const faction2 = storage.resolveFaction(input2);
+        
+        if (!faction1) {
+            return await interaction.editReply({ content: `❌ First faction not found: "${input1}"` });
+        }
+        
+        if (!faction2) {
+            return await interaction.editReply({ content: `❌ Second faction not found: "${input2}"` });
+        }
+        
+        const { sideBySide, difference } = await heatmap.createComparisonHeatmaps(
+            faction1.id, faction2.id, granularity, days
+        );
+        
+        const attachment1 = new AttachmentBuilder(sideBySide, { name: 'comparison_side_by_side.png' });
+        const attachment2 = new AttachmentBuilder(difference, { name: 'comparison_difference.png' });
+        
+        await interaction.editReply({ 
+            content: `**${faction1.name}** vs **${faction2.name}**`,
+            files: [attachment1] 
+        });
+        
+        await interaction.followUp({ 
+            content: '**Difference heatmap:**',
+            files: [attachment2] 
+        });
+        
+    } catch (error) {
+        console.error('Compare error:', error);
+        await interaction.editReply({ content: `❌ Error: ${error.message}` });
+    }
+}
+
+// ============================================
+// MANAGEMENT HANDLERS
+// ============================================
+
+async function handleAddFactions(interaction) {
+    const input = interaction.options.getString('factions');
+    
+    await interaction.deferReply({ ephemeral: true });
+    
+    try {
+        const resolved = resolveMultipleFactions(input);
+        
+        if (resolved.length === 0) {
+            return await interaction.editReply({
+                content: '❌ No valid factions found. Use faction names or IDs.'
+            });
+        }
+        
+        const ids = resolved.map(f => f.id);
+        const result = storage.addFactionsByIds(ids);
+        
+        let response = `✅ Added **${result.added}** faction(s)`;
+        
+        if (result.skipped > 0) {
+            response += ` (${result.skipped} already tracked)`;
+        }
+        
+        if (result.added > 0 && resolved.length <= 10) {
+            response += '\n\n**Added:**\n' + resolved
+                .filter(f => !storage.loadConfig().factions.includes(f.id) || result.added === resolved.length)
+                .slice(0, result.added)
+                .map(f => `• ${f.name} [${f.id}]${f.members ? ` - ${f.members} members` : ''}`)
+                .join('\n');
+        }
+        
+        const config = storage.loadConfig();
+        const estimate = api.estimateCollectionTime(config.factions.length);
+        response += `\n\n📈 Now tracking **${config.factions.length}** factions`;
+        response += `\n⏱️ Est. collection time: **${Math.ceil(estimate / 60)}** minutes`;
+        
+        if (estimate > 14 * 60) {
+            response += `\n⚠️ Warning: Collection may not complete in 15 min. Add more API keys.`;
+        }
+        
+        await interaction.editReply({ content: response });
+        
+    } catch (error) {
+        console.error('Add factions error:', error);
+        await interaction.editReply({ content: `❌ Error: ${error.message}` });
+    }
+}
+
+async function handleAddRank(interaction) {
+    const rank = interaction.options.getString('rank');
+    const minMembers = interaction.options.getInteger('min-members');
+    const maxMembers = interaction.options.getInteger('max-members');
+    
+    await interaction.deferReply({ ephemeral: true });
+    
+    try {
+        await hof.ensureHOFCache();
+        
+        const result = storage.addFactionsByRank(rank, minMembers, maxMembers);
+        
+        let response = `✅ Added **${result.added}** ${rank} faction(s)`;
+        
+        if (result.skipped > 0) {
+            response += ` (${result.skipped} already tracked)`;
+        }
+        
+        // Show filter info
+        const filters = [];
+        if (minMembers) filters.push(`min ${minMembers}`);
+        if (maxMembers) filters.push(`max ${maxMembers}`);
+        if (filters.length > 0) {
+            response += `\n📊 Filter: ${filters.join(', ')} members`;
+        }
+        
+        if (result.added > 0 && result.added <= 10) {
+            response += '\n\n**Added:**\n' + result.factions.map(f => 
+                `• ${f.name} [${f.id}] - ${f.members} members`
+            ).join('\n');
+        }
+        
+        const config = storage.loadConfig();
+        const estimate = api.estimateCollectionTime(config.factions.length);
+        response += `\n\n📈 Now tracking **${config.factions.length}** factions`;
+        response += `\n⏱️ Est. collection time: **${Math.ceil(estimate / 60)}** minutes`;
+        
+        if (estimate > 14 * 60) {
+            response += `\n⚠️ Warning: Collection may not complete in 15 min. Add more API keys.`;
+        }
+        
+        await interaction.editReply({ content: response });
+        
+    } catch (error) {
+        console.error('Add rank error:', error);
+        await interaction.editReply({ content: `❌ Error: ${error.message}` });
+    }
+}
+
+
+async function handleAddKeys(interaction) {
+    const keysInput = interaction.options.getString('keys');
+    
+    const keys = keysInput.split(',')
+        .map(k => k.trim())
+        .filter(k => k.length > 0);
+    
+    if (keys.length === 0) {
+        return await interaction.reply({
+            content: '❌ No valid API keys provided.',
+            ephemeral: true
+        });
+    }
+    
+    const result = storage.addApiKeys(keys);
+    
+    await interaction.reply({
+        content: `✅ Added **${result.added}** API key(s)` + 
+            (result.skipped > 0 ? ` (${result.skipped} already exist)` : ''),
+        ephemeral: true
+    });
+}
+
+async function handleRemoveFactions(interaction) {
+    const input = interaction.options.getString('factions');
+    
+    await interaction.deferReply({ ephemeral: true });
+    
+    try {
+        const resolved = resolveMultipleFactions(input);
+        
+        if (resolved.length === 0) {
+            return await interaction.editReply({
+                content: '❌ No valid factions found. Use faction names or IDs.'
+            });
+        }
+        
+        const ids = resolved.map(f => f.id);
+        const result = storage.removeFactionsByIds(ids);
+        
+        let response = result.removed > 0
+            ? `✅ Removed **${result.removed}** faction(s)`
+            : '⚠️ No matching factions found to remove.';
+        
+        if (result.removed > 0 && resolved.length <= 10) {
+            response += '\n\n**Removed:**\n' + resolved
+                .slice(0, result.removed)
+                .map(f => `• ${f.name} [${f.id}]${f.members ? ` - ${f.members} members` : ''}`)
+                .join('\n');
+        }
+        
+        const config = storage.loadConfig();
+        response += `\n\n📈 Now tracking **${config.factions.length}** factions`;
+        
+        await interaction.editReply({ content: response });
+        
+    } catch (error) {
+        console.error('Remove factions error:', error);
+        await interaction.editReply({ content: `❌ Error: ${error.message}` });
+    }
+}
+
+
+function resolveMultipleFactions(input) {
+    const parts = input.split(',').map(p => p.trim()).filter(p => p.length > 0);
+    const resolved = [];
+    const seen = new Set();
+    
+    for (const part of parts) {
+        // Try as ID first
+        const asNumber = parseInt(part);
+        if (!isNaN(asNumber) && asNumber.toString() === part) {
+            if (!seen.has(asNumber)) {
+                // Try to get name from HOF or storage
+                const hofData = hof.getFactionFromHOF(asNumber);
+                const storageData = storage.loadFactionData(asNumber);
+                
+                resolved.push({
+                    id: asNumber,
+                    name: hofData?.name || storageData?.name || `Faction ${asNumber}`,
+                    members: hofData?.members || null
+                });
+                seen.add(asNumber);
+            }
+            continue;
+        }
+        
+        // Try as name - search HOF first, then tracked
+        const hofResults = hof.searchHOFByName(part);
+        const trackedResults = storage.searchFactionByName(part);
+        
+        // Find exact match first
+        let found = hofResults.find(f => f.name.toLowerCase() === part.toLowerCase());
+        if (!found) {
+            found = trackedResults.find(f => f.name.toLowerCase() === part.toLowerCase());
+        }
+        // If no exact match, use first result
+        if (!found && hofResults.length > 0) {
+            found = hofResults[0];
+        }
+        if (!found && trackedResults.length > 0) {
+            found = trackedResults[0];
+        }
+        
+        if (found && !seen.has(found.id)) {
+            resolved.push({
+                id: found.id,
+                name: found.name,
+                members: found.members || null
+            });
+            seen.add(found.id);
+        }
+    }
+    
+    return resolved;
+}
+
+async function handleRemoveRank(interaction) {
+    const rank = interaction.options.getString('rank');
+    const minMembers = interaction.options.getInteger('min-members');
+    const maxMembers = interaction.options.getInteger('max-members');
+    
+    await interaction.deferReply({ ephemeral: true });
+    
+    try {
+        await hof.ensureHOFCache();
+        
+        const result = storage.removeFactionsByRank(rank, minMembers, maxMembers);
+        
+        let response = result.removed > 0
+            ? `✅ Removed **${result.removed}** ${rank} faction(s)`
+            : `⚠️ No matching ${rank} factions were being tracked.`;
+        
+        // Show filter info
+        const filters = [];
+        if (minMembers) filters.push(`min ${minMembers}`);
+        if (maxMembers) filters.push(`max ${maxMembers}`);
+        if (filters.length > 0) {
+            response += `\n📊 Filter: ${filters.join(', ')} members`;
+        }
+        
+        if (result.removed > 0 && result.removed <= 10) {
+            response += '\n\n**Removed:**\n' + result.factions.map(f => 
+                `• ${f.name} [${f.id}] - ${f.members} members`
+            ).join('\n');
+        }
+        
+        const config = storage.loadConfig();
+        response += `\n\n📈 Now tracking **${config.factions.length}** factions`;
+        
+        await interaction.editReply({ content: response });
+        
+    } catch (error) {
+        console.error('Remove rank error:', error);
+        await interaction.editReply({ content: `❌ Error: ${error.message}` });
+    }
+}
+
+async function handleRemoveKey(interaction) {
+    const key = interaction.options.getString('key');
+    
+    const result = storage.removeApiKey(key);
+    
+    await interaction.reply({
+        content: result.removed 
+            ? '✅ API key removed.'
+            : '⚠️ API key not found.',
+        ephemeral: true
+    });
+}
+
+async function handleList(interaction) {
+    const config = storage.loadConfig();
+    const hofStats = hof.getHOFStats();
+    
+    let response = '**📊 Activity Tracker Configuration**\n\n';
+    
+    // Factions
+    response += `**Factions:** ${config.factions.length} tracked\n`;
+    
+    if (config.factions.length > 0 && config.factions.length <= 20) {
+        for (const factionId of config.factions) {
+            const data = storage.loadFactionData(factionId);
+            const hofData = hof.getFactionFromHOF(factionId);
+            const name = data?.name || hofData?.name || 'Unknown';
+            const rank = hofData?.rank || 'N/A';
+            const snapshots = data?.snapshots?.length || 0;
+            response += `> • ${name} [${factionId}] - ${rank} - ${snapshots} snapshots\n`;
+        }
+    } else if (config.factions.length > 20) {
+        // Group by rank
+        const byRank = {};
+        for (const factionId of config.factions) {
+            const hofData = hof.getFactionFromHOF(factionId);
+            const baseRank = hofData?.rank?.split(' ')[0] || 'Unknown';
+            byRank[baseRank] = (byRank[baseRank] || 0) + 1;
+        }
+        
+        for (const [rank, count] of Object.entries(byRank).sort()) {
+            response += `> • ${rank}: ${count}\n`;
+        }
+    }
+    
+    // API Keys
+    response += `\n**API Keys:** ${config.apikeys.length} configured\n`;
+    
+    // Collection estimate
+    const estimate = api.estimateCollectionTime(config.factions.length);
+    response += `\n**Collection:**\n`;
+    response += `> Rate limit: ${api.RATE_LIMIT_PER_KEY} calls/min/key\n`;
+    response += `> Max throughput: ${config.apikeys.length * api.RATE_LIMIT_PER_KEY} calls/min\n`;
+    response += `> Est. collection time: ${Math.ceil(estimate / 60)} min\n`;
+    
+    if (estimate > 14 * 60) {
+        const neededKeys = Math.ceil(config.factions.length / (api.RATE_LIMIT_PER_KEY * 14));
+        response += `\n⚠️ **Warning:** Need ${neededKeys}+ keys to finish in 15 min!\n`;
+    }
+    
+    // HOF cache
+    response += `\n**HOF Cache:**\n`;
+    response += `> Total factions: ${hofStats.total}\n`;
+    
+    if (hofStats.lastUpdated > 0) {
+        const age = Math.floor((Date.now() - hofStats.lastUpdated) / (1000 * 60 * 60));
+        response += `> Last updated: ${age} hours ago\n`;
+    } else {
+        response += `> Not yet cached\n`;
+    }
+    
+    await interaction.reply({ content: response, ephemeral: true });
+}
+
+async function handleStatus(interaction) {
+    const status = collector.getCollectorStatus();
+    
+    let response = '**🔄 Collector Status**\n\n';
+    
+    const stateEmoji = status.running ? (status.collecting ? '🟡' : '🟢') : '🔴';
+    const stateText = status.running ? (status.collecting ? 'Collecting...' : 'Running') : 'Stopped';
+    
+    response += `**State:** ${stateEmoji} ${stateText}\n`;
+    response += `**Factions:** ${status.factionCount}\n`;
+    response += `**API Keys:** ${status.keyCount}\n`;
+    response += `**Rate Limit:** ${status.rateLimit} calls/min/key\n`;
+    response += `**Est. Collection Time:** ${Math.ceil(status.estimatedCollectionTime / 60)} min\n`;
+    
+    if (status.lastCollection) {
+        const last = status.lastCollection;
+        const duration = Math.floor((last.endTime - last.startTime) / 1000);
+        const ago = Math.floor((Date.now() - last.endTime) / 1000 / 60);
+        
+        response += `\n**Last Collection:**\n`;
+        response += `> Completed: ${ago} min ago\n`;
+        response += `> Success: ${last.success}/${last.success + last.failed}\n`;
+        response += `> Duration: ${Math.floor(duration / 60)}m ${duration % 60}s\n`;
+    }
+    
+    response += `\n**API Key Usage (current minute):**\n`;
+    for (const [key, info] of Object.entries(status.rateLimitStatus)) {
+        const emoji = info.failed ? '❌' : (info.calls >= info.limit ? '🟡' : '🟢');
+        response += `> ${emoji} Key ${key}: ${info.calls}/${info.limit} calls\n`;
+    }
+    
+    await interaction.reply({ content: response, ephemeral: true });
+}
+
+async function handleCollect(interaction) {
+    const status = collector.getCollectorStatus();
+    
+    if (status.collecting) {
+        return await interaction.reply({
+            content: '⚠️ Collection already in progress.',
+            ephemeral: true
+        });
+    }
+    
+    const config = storage.loadConfig();
+    const estimate = api.estimateCollectionTime(config.factions.length);
+    
+    await interaction.reply({
+        content: `🔄 Starting manual collection of ${config.factions.length} factions...\n` +
+            `⏱️ Estimated time: ${Math.ceil(estimate / 60)} minutes\n\n` +
+            `Check console for progress.`,
+        ephemeral: true
+    });
+    
+    collector.collectAllFactions();
+}
+
+async function handleRefreshHOF(interaction) {
+    await interaction.deferReply({ ephemeral: true });
+    
+    try {
+        let lastUpdate = '';
+        const cache = await hof.updateHOFCache((page, count) => {
+            lastUpdate = `📥 Fetching page ${page}... (${count} factions)`;
+        });
+        
+        const stats = hof.getHOFStats();
+        
+        let response = `✅ **HOF Cache Updated**\n\n`;
+        response += `**Total Factions:** ${stats.total}\n\n`;
+        response += `**By Rank:**\n`;
+        
+        for (const [rank, count] of Object.entries(stats.byRank).sort()) {
+            response += `> ${rank}: ${count}\n`;
+        }
+        
+        await interaction.editReply({ content: response });
+        
+    } catch (error) {
+        console.error('Refresh HOF error:', error);
+        await interaction.editReply({ content: `❌ Error: ${error.message}` });
+    }
+}
+
+================================================================================
+
+File: src/heatmap.js
+----------------------------------------
+const { createCanvas } = require('canvas');
+const { 
+    parseDaysFilter, 
+    getHourFromTimestamp,
+    get15MinSlotInHour,
+    getDayOfWeek, 
+    getThirtyDaysAgo,
+    getWeekId,
+    getUniqueWeeks,
+    DAY_LABELS
+} = require('./utils/helpers');
+const storage = require('./utils/storage');
+
+// Color interpolation: Red -> Yellow -> Green
+function getColor(value, min, max) {
+    if (max === min) {
+        return 'rgb(255, 255, 0)';
+    }
+    
+    const ratio = Math.max(0, Math.min(1, (value - min) / (max - min)));
+    
+    let r, g, b;
+    
+    if (ratio < 0.5) {
+        const t = ratio * 2;
+        r = 255;
+        g = Math.round(255 * t);
+        b = 50;
+    } else {
+        const t = (ratio - 0.5) * 2;
+        r = Math.round(255 * (1 - t));
+        g = 255;
+        b = 50;
+    }
+    
+    return `rgb(${r}, ${g}, ${b})`;
+}
+
+function getTextColor(value, min, max) {
+    const ratio = max > min ? (value - min) / (max - min) : 0.5;
+    return ratio > 0.3 ? '#000000' : '#FFFFFF';
+}
+
+// ============================================
+// FACTION AGGREGATION
+// ============================================
+
+function aggregateFactionDataHourly(factionData, dayFilter) {
+    const daysToShow = parseDaysFilter(dayFilter);
+    const thirtyDaysAgo = getThirtyDaysAgo();
+    const now = Math.floor(Date.now() / 1000);
+    const snapshots = storage.getSnapshotsNormalized(factionData);
+    
+    // Structure: [hour][day][weekId] = Set of member IDs
+    const hourlyData = {};
+    for (let hour = 0; hour < 24; hour++) {
+        hourlyData[hour] = {};
+        for (const day of daysToShow) {
+            hourlyData[hour][day] = {};
+        }
+    }
+    
+    for (const snapshot of snapshots) {
+        if (snapshot.timestamp < thirtyDaysAgo) continue;
+        
+        const day = getDayOfWeek(snapshot.timestamp);
+        if (!daysToShow.includes(day)) continue;
+        
+        const hour = getHourFromTimestamp(snapshot.timestamp);
+        const weekId = getWeekId(snapshot.timestamp, now);
+        
+        if (!hourlyData[hour][day][weekId]) {
+            hourlyData[hour][day][weekId] = new Set();
+        }
+        
+        for (const memberId of snapshot.active) {
+            hourlyData[hour][day][weekId].add(memberId);
+        }
+    }
+    
+    const result = {};
+    let globalMin = Infinity;
+    let globalMax = -Infinity;
+    
+    for (let hour = 0; hour < 24; hour++) {
+        result[hour] = {};
+        for (const day of daysToShow) {
+            const weekData = hourlyData[hour][day];
+            const weekIds = Object.keys(weekData);
+            
+            if (weekIds.length === 0) {
+                result[hour][day] = 0;
+            } else {
+                let total = 0;
+                for (const weekId of weekIds) {
+                    total += weekData[weekId].size;
+                }
+                result[hour][day] = Math.round(total / weekIds.length * 10) / 10;
+            }
+            
+            if (result[hour][day] < globalMin) globalMin = result[hour][day];
+            if (result[hour][day] > globalMax) globalMax = result[hour][day];
+        }
+    }
+    
+    return { 
+        data: result, 
+        min: globalMin === Infinity ? 0 : globalMin, 
+        max: globalMax === -Infinity ? 0 : globalMax, 
+        days: daysToShow 
+    };
+}
+
+function aggregateFactionData15Min(factionData, dayFilter) {
+    const daysToShow = parseDaysFilter(dayFilter);
+    const thirtyDaysAgo = getThirtyDaysAgo();
+    const now = Math.floor(Date.now() / 1000);
+    const snapshots = storage.getSnapshotsNormalized(factionData);
+    
+    // Structure: [hour][day][slot][weekId] = Set of member IDs
+    const data = {};
+    for (let hour = 0; hour < 24; hour++) {
+        data[hour] = {};
+        for (const day of daysToShow) {
+            data[hour][day] = {
+                0: {}, 1: {}, 2: {}, 3: {}
+            };
+        }
+    }
+    
+    for (const snapshot of snapshots) {
+        if (snapshot.timestamp < thirtyDaysAgo) continue;
+        
+        const day = getDayOfWeek(snapshot.timestamp);
+        if (!daysToShow.includes(day)) continue;
+        
+        const hour = getHourFromTimestamp(snapshot.timestamp);
+        const slot = get15MinSlotInHour(snapshot.timestamp);
+        const weekId = getWeekId(snapshot.timestamp, now);
+        
+        if (!data[hour][day][slot][weekId]) {
+            data[hour][day][slot][weekId] = new Set();
+        }
+        
+        for (const memberId of snapshot.active) {
+            data[hour][day][slot][weekId].add(memberId);
+        }
+    }
+    
+    const result = {};
+    let globalMin = Infinity;
+    let globalMax = -Infinity;
+    
+    for (let hour = 0; hour < 24; hour++) {
+        result[hour] = {};
+        for (const day of daysToShow) {
+            result[hour][day] = [];
+            
+            for (let slot = 0; slot < 4; slot++) {
+                const weekData = data[hour][day][slot];
+                const weekIds = Object.keys(weekData);
+                
+                let avg = 0;
+                if (weekIds.length > 0) {
+                    let total = 0;
+                    for (const weekId of weekIds) {
+                        total += weekData[weekId].size;
+                    }
+                    avg = Math.round(total / weekIds.length * 10) / 10;
+                }
+                
+                result[hour][day].push(avg);
+                
+                if (avg < globalMin) globalMin = avg;
+                if (avg > globalMax) globalMax = avg;
+            }
+        }
+    }
+    
+    return { 
+        data: result, 
+        min: globalMin === Infinity ? 0 : globalMin, 
+        max: globalMax === -Infinity ? 0 : globalMax, 
+        days: daysToShow,
+        is15Min: true
+    };
+}
+
+// ============================================
+// USER AGGREGATION (MULTI-FACTION)
+// ============================================
+
+function aggregateUserDataHourlyMultiFaction(userId, dayFilter) {
+    const daysToShow = parseDaysFilter(dayFilter);
+    const thirtyDaysAgo = getThirtyDaysAgo();
+    const now = Math.floor(Date.now() / 1000);
+    
+    // Find all factions user has been in
+    const factionIds = storage.findUserInAllFactions(userId);
+    
+    if (factionIds.length === 0) {
+        return null;
+    }
+    
+    // Aggregate across all factions
+    const hourlyData = {};
+    for (let hour = 0; hour < 24; hour++) {
+        hourlyData[hour] = {};
+        for (const day of daysToShow) {
+            hourlyData[hour][day] = {
+                weeksWithData: new Set(),
+                weeksActive: new Set()
+            };
+        }
+    }
+    
+    for (const factionId of factionIds) {
+        const factionData = storage.loadFactionData(factionId);
+        const snapshots = storage.getSnapshotsNormalized(factionData);
+        
+        for (const snapshot of snapshots) {
+            if (snapshot.timestamp < thirtyDaysAgo) continue;
+            
+            const day = getDayOfWeek(snapshot.timestamp);
+            if (!daysToShow.includes(day)) continue;
+            
+            const hour = getHourFromTimestamp(snapshot.timestamp);
+            const weekId = getWeekId(snapshot.timestamp, now);
+            
+            // Create unique week key to avoid double counting
+            const weekKey = `${factionId}-${weekId}`;
+            hourlyData[hour][day].weeksWithData.add(weekKey);
+            
+            if (snapshot.active.includes(userId)) {
+                hourlyData[hour][day].weeksActive.add(weekKey);
+            }
+        }
+    }
+    
+    const result = {};
+    
+    for (let hour = 0; hour < 24; hour++) {
+        result[hour] = {};
+        for (const day of daysToShow) {
+            const { weeksWithData, weeksActive } = hourlyData[hour][day];
+            
+            if (weeksWithData.size === 0) {
+                result[hour][day] = 0;
+            } else {
+                result[hour][day] = Math.round((weeksActive.size / weeksWithData.size) * 100);
+            }
+        }
+    }
+    
+    return { 
+        data: result, 
+        min: 0, 
+        max: 100, 
+        days: daysToShow,
+        isPercentage: true,
+        factionIds
+    };
+}
+
+function aggregateUserData15MinMultiFaction(userId, dayFilter) {
+    const daysToShow = parseDaysFilter(dayFilter);
+    const thirtyDaysAgo = getThirtyDaysAgo();
+    
+    const factionIds = storage.findUserInAllFactions(userId);
+    
+    if (factionIds.length === 0) {
+        return null;
+    }
+    
+    // Structure: [hour][day][slot] = { total: 0, active: 0 }
+    const data = {};
+    for (let hour = 0; hour < 24; hour++) {
+        data[hour] = {};
+        for (const day of daysToShow) {
+            data[hour][day] = {
+                0: { total: 0, active: 0 },
+                1: { total: 0, active: 0 },
+                2: { total: 0, active: 0 },
+                3: { total: 0, active: 0 }
+            };
+        }
+    }
+    
+    // Track processed snapshots to avoid double counting
+    const processedSnapshots = new Set();
+    
+    for (const factionId of factionIds) {
+        const factionData = storage.loadFactionData(factionId);
+        const snapshots = storage.getSnapshotsNormalized(factionData);
+        
+        for (const snapshot of snapshots) {
+            if (snapshot.timestamp < thirtyDaysAgo) continue;
+            
+            // Unique key for this snapshot
+            const snapshotKey = `${snapshot.timestamp}`;
+            if (processedSnapshots.has(snapshotKey)) continue;
+            processedSnapshots.add(snapshotKey);
+            
+            const day = getDayOfWeek(snapshot.timestamp);
+            if (!daysToShow.includes(day)) continue;
+            
+            const hour = getHourFromTimestamp(snapshot.timestamp);
+            const slot = get15MinSlotInHour(snapshot.timestamp);
+            
+            data[hour][day][slot].total++;
+            
+            if (snapshot.active.includes(userId)) {
+                data[hour][day][slot].active++;
+            }
+        }
+    }
+    
+    const result = {};
+    
+    for (let hour = 0; hour < 24; hour++) {
+        result[hour] = {};
+        for (const day of daysToShow) {
+            result[hour][day] = [];
+            
+            for (let slot = 0; slot < 4; slot++) {
+                const { total, active } = data[hour][day][slot];
+                
+                if (total === 0) {
+                    result[hour][day].push(0);
+                } else {
+                    result[hour][day].push(Math.round((active / total) * 100));
+                }
+            }
+        }
+    }
+    
+    return { 
+        data: result, 
+        min: 0, 
+        max: 100, 
+        days: daysToShow,
+        is15Min: true,
+        isPercentage: true,
+        factionIds
+    };
+}
+
+// ============================================
+// IMAGE GENERATION
+// ============================================
+
+function generateHeatmapImage(title, aggregatedData, subtitle = '') {
+    const { data, min, max, days, isPercentage } = aggregatedData;
+    
+    const cellWidth = 55;
+    const cellHeight = 28;
+    const labelWidth = 60;
+    const headerHeight = 50;
+    const titleHeight = subtitle ? 65 : 45;
+    const legendHeight = 40;
+    const padding = 20;
+    
+    const width = labelWidth + (days.length * cellWidth) + padding * 2;
+    const height = titleHeight + headerHeight + (24 * cellHeight) + legendHeight + padding * 2;
+    
+    const canvas = createCanvas(width, height);
+    const ctx = canvas.getContext('2d');
+    
+    ctx.fillStyle = '#2C2F33';
+    ctx.fillRect(0, 0, width, height);
+    
+    ctx.fillStyle = '#FFFFFF';
+    ctx.font = 'bold 18px Arial';
+    ctx.textAlign = 'center';
+    ctx.fillText(title, width / 2, padding + 25);
+    
+    if (subtitle) {
+        ctx.font = '12px Arial';
+        ctx.fillStyle = '#AAAAAA';
+        ctx.fillText(subtitle, width / 2, padding + 45);
+    }
+    
+    ctx.font = 'bold 14px Arial';
+    ctx.textAlign = 'center';
+    
+    days.forEach((day, i) => {
+        const x = padding + labelWidth + (i * cellWidth) + cellWidth / 2;
+        const y = padding + titleHeight + 30;
+        ctx.fillStyle = '#FFFFFF';
+        ctx.fillText(DAY_LABELS[day], x, y);
+    });
+    
+    ctx.font = '12px Arial';
+    
+    for (let hour = 0; hour < 24; hour++) {
+        const y = padding + titleHeight + headerHeight + (hour * cellHeight);
+        
+        ctx.fillStyle = '#AAAAAA';
+        ctx.textAlign = 'right';
+        ctx.fillText(`${hour.toString().padStart(2, '0')}:00`, padding + labelWidth - 8, y + cellHeight / 2 + 4);
+        
+        days.forEach((day, i) => {
+            const x = padding + labelWidth + (i * cellWidth);
+            const value = data[hour][day];
+            
+            ctx.fillStyle = getColor(value, min, max);
+            ctx.fillRect(x + 2, y + 2, cellWidth - 4, cellHeight - 4);
+            
+            ctx.strokeStyle = '#1E2124';
+            ctx.lineWidth = 1;
+            ctx.strokeRect(x + 2, y + 2, cellWidth - 4, cellHeight - 4);
+            
+            ctx.fillStyle = getTextColor(value, min, max);
+            ctx.textAlign = 'center';
+            ctx.font = '12px Arial';
+            
+            let displayValue;
+            if (isPercentage) {
+                displayValue = `${Math.round(value)}%`;
+            } else {
+                displayValue = Number.isInteger(value) ? value.toString() : value.toFixed(1);
+            }
+            ctx.fillText(displayValue, x + cellWidth / 2, y + cellHeight / 2 + 4);
+        });
+    }
+    
+    const legendY = height - legendHeight - padding + 10;
+    const legendWidth = 200;
+    const legendX = (width - legendWidth) / 2;
+    
+    const gradient = ctx.createLinearGradient(legendX, 0, legendX + legendWidth, 0);
+    gradient.addColorStop(0, 'rgb(255, 50, 50)');
+    gradient.addColorStop(0.5, 'rgb(255, 255, 50)');
+    gradient.addColorStop(1, 'rgb(50, 255, 50)');
+    
+    ctx.fillStyle = gradient;
+    ctx.fillRect(legendX, legendY, legendWidth, 15);
+    
+    ctx.strokeStyle = '#1E2124';
+    ctx.strokeRect(legendX, legendY, legendWidth, 15);
+    
+    ctx.fillStyle = '#FFFFFF';
+    ctx.font = '11px Arial';
+    ctx.textAlign = 'center';
+    
+    const minLabel = isPercentage ? `${min}%` : min.toString();
+    const maxLabel = isPercentage ? `${max}%` : max.toString();
+    ctx.fillText(minLabel, legendX, legendY + 28);
+    ctx.fillText(maxLabel, legendX + legendWidth, legendY + 28);
+    
+    return canvas.toBuffer('image/png');
+}
+
+function generateCompact15MinImage(title, aggregatedData, subtitle = '') {
+    const { data, min, max, days, isPercentage } = aggregatedData;
+    
+    const cellWidth = 75;
+    const cellHeight = 24;
+    const labelWidth = 60;
+    const headerHeight = 50;
+    const titleHeight = subtitle ? 65 : 45;
+    const legendHeight = 50;
+    const padding = 20;
+    
+    const width = labelWidth + (days.length * cellWidth) + padding * 2;
+    const height = titleHeight + headerHeight + (24 * cellHeight) + legendHeight + padding * 2;
+    
+    const canvas = createCanvas(width, height);
+    const ctx = canvas.getContext('2d');
+    
+    ctx.fillStyle = '#2C2F33';
+    ctx.fillRect(0, 0, width, height);
+    
+    ctx.fillStyle = '#FFFFFF';
+    ctx.font = 'bold 18px Arial';
+    ctx.textAlign = 'center';
+    ctx.fillText(title, width / 2, padding + 25);
+    
+    if (subtitle) {
+        ctx.font = '12px Arial';
+        ctx.fillStyle = '#AAAAAA';
+        ctx.fillText(subtitle, width / 2, padding + 45);
+    }
+    
+    ctx.font = 'bold 14px Arial';
+    ctx.textAlign = 'center';
+    
+    days.forEach((day, i) => {
+        const x = padding + labelWidth + (i * cellWidth) + cellWidth / 2;
+        const y = padding + titleHeight + 30;
+        ctx.fillStyle = '#FFFFFF';
+        ctx.fillText(DAY_LABELS[day], x, y);
+    });
+    
+    for (let hour = 0; hour < 24; hour++) {
+        const y = padding + titleHeight + headerHeight + (hour * cellHeight);
+        
+        ctx.fillStyle = '#AAAAAA';
+        ctx.textAlign = 'right';
+        ctx.font = '11px Arial';
+        ctx.fillText(`${hour.toString().padStart(2, '0')}:00`, padding + labelWidth - 8, y + cellHeight / 2 + 4);
+        
+        days.forEach((day, i) => {
+            const x = padding + labelWidth + (i * cellWidth);
+            const values = data[hour][day];
+            
+            const subWidth = (cellWidth - 4) / 4;
+            
+            for (let slot = 0; slot < 4; slot++) {
+                const subX = x + 2 + (slot * subWidth);
+                const val = values[slot];
+                
+                ctx.fillStyle = getColor(val, min, max);
+                ctx.fillRect(subX + 1, y + 3, subWidth - 2, cellHeight - 6);
+                
+                ctx.fillStyle = getTextColor(val, min, max);
+                ctx.textAlign = 'center';
+                ctx.font = '9px Arial';
+                
+                let displayVal;
+                if (isPercentage) {
+                    displayVal = Math.round(val).toString();
+                } else {
+                    displayVal = Math.round(val).toString();
+                }
+                ctx.fillText(displayVal, subX + subWidth / 2, y + cellHeight / 2 + 3);
+            }
+        });
+    }
+    
+    const legendY = height - legendHeight - padding + 10;
+    ctx.fillStyle = '#FFFFFF';
+    ctx.font = '11px Arial';
+    ctx.textAlign = 'center';
+    
+    const legendText = isPercentage 
+        ? 'Each cell: :00 | :15 | :30 | :45 (% active)'
+        : 'Each cell: :00 | :15 | :30 | :45 (avg members)';
+    ctx.fillText(legendText, width / 2, legendY);
+    
+    const gradWidth = 150;
+    const gradX = (width - gradWidth) / 2;
+    
+    const gradient = ctx.createLinearGradient(gradX, 0, gradX + gradWidth, 0);
+    gradient.addColorStop(0, 'rgb(255, 50, 50)');
+    gradient.addColorStop(0.5, 'rgb(255, 255, 50)');
+    gradient.addColorStop(1, 'rgb(50, 255, 50)');
+    
+    ctx.fillStyle = gradient;
+    ctx.fillRect(gradX, legendY + 10, gradWidth, 12);
+    
+    ctx.strokeStyle = '#1E2124';
+    ctx.strokeRect(gradX, legendY + 10, gradWidth, 12);
+    
+    const minLabel = isPercentage ? '0%' : min.toString();
+    const maxLabel = isPercentage ? '100%' : max.toString();
+    ctx.fillStyle = '#FFFFFF';
+    ctx.fillText(minLabel, gradX, legendY + 35);
+    ctx.fillText(maxLabel, gradX + gradWidth, legendY + 35);
+    
+    return canvas.toBuffer('image/png');
+}
+
+function generateComparisonImage(title1, data1, title2, data2) {
+    const days = data1.days;
+    const is15Min = data1.is15Min;
+    
+    const cellWidth = is15Min ? 65 : 45;
+    const cellHeight = 22;
+    const labelWidth = 45;
+    const headerHeight = 45;
+    const titleHeight = 35;
+    const gapWidth = 25;
+    const padding = 15;
+    const sectionWidth = labelWidth + (days.length * cellWidth);
+    
+    const width = (sectionWidth * 2) + gapWidth + padding * 2;
+    const height = titleHeight + headerHeight + (24 * cellHeight) + padding * 2 + 30;
+    
+    const canvas = createCanvas(width, height);
+    const ctx = canvas.getContext('2d');
+    
+    ctx.fillStyle = '#2C2F33';
+    ctx.fillRect(0, 0, width, height);
+    
+    const globalMin = Math.min(data1.min, data2.min);
+    const globalMax = Math.max(data1.max, data2.max);
+    
+    function drawSection(data, title, offsetX) {
+        ctx.fillStyle = '#FFFFFF';
+        ctx.font = 'bold 13px Arial';
+        ctx.textAlign = 'center';
+        ctx.fillText(title, offsetX + sectionWidth / 2, padding + 20);
+        
+        ctx.font = 'bold 10px Arial';
+        days.forEach((day, i) => {
+            const x = offsetX + labelWidth + (i * cellWidth) + cellWidth / 2;
+            ctx.fillText(DAY_LABELS[day], x, padding + titleHeight + 22);
+        });
+        
+        for (let hour = 0; hour < 24; hour++) {
+            const y = padding + titleHeight + headerHeight + (hour * cellHeight);
+            
+            if (offsetX === padding) {
+                ctx.fillStyle = '#AAAAAA';
+                ctx.textAlign = 'right';
+                ctx.font = '9px Arial';
+                ctx.fillText(`${hour.toString().padStart(2, '0')}:00`, offsetX + labelWidth - 4, y + cellHeight / 2 + 3);
+            }
+            
+            days.forEach((day, i) => {
+                const x = offsetX + labelWidth + (i * cellWidth);
+                
+                if (is15Min) {
+                    const values = data.data[hour][day];
+                    const subWidth = (cellWidth - 2) / 4;
+                    
+                    for (let slot = 0; slot < 4; slot++) {
+                        const subX = x + 1 + (slot * subWidth);
+                        const val = values[slot];
+                        
+                        ctx.fillStyle = getColor(val, globalMin, globalMax);
+                        ctx.fillRect(subX, y + 1, subWidth - 1, cellHeight - 2);
+                        
+                        ctx.fillStyle = getTextColor(val, globalMin, globalMax);
+                        ctx.textAlign = 'center';
+                        ctx.font = '7px Arial';
+                        ctx.fillText(Math.round(val).toString(), subX + subWidth / 2, y + cellHeight / 2 + 2);
+                    }
+                } else {
+                    const value = data.data[hour][day];
+                    
+                    ctx.fillStyle = getColor(value, globalMin, globalMax);
+                    ctx.fillRect(x + 1, y + 1, cellWidth - 2, cellHeight - 2);
+                    
+                    ctx.strokeStyle = '#1E2124';
+                    ctx.lineWidth = 1;
+                    ctx.strokeRect(x + 1, y + 1, cellWidth - 2, cellHeight - 2);
+                    
+                    ctx.fillStyle = getTextColor(value, globalMin, globalMax);
+                    ctx.textAlign = 'center';
+                    ctx.font = '9px Arial';
+                    const displayValue = Number.isInteger(value) ? value.toString() : value.toFixed(1);
+                    ctx.fillText(displayValue, x + cellWidth / 2, y + cellHeight / 2 + 3);
+                }
+            });
+        }
+    }
+    
+    drawSection(data1, title1, padding);
+    drawSection(data2, title2, padding + sectionWidth + gapWidth);
+    
+    return canvas.toBuffer('image/png');
+}
+
+function generateDifferenceImage(title1, data1, title2, data2) {
+    const days = data1.days;
+    const is15Min = data1.is15Min;
+    
+    const cellWidth = is15Min ? 75 : 55;
+    const cellHeight = is15Min ? 24 : 28;
+    const labelWidth = 60;
+    const headerHeight = 50;
+    const titleHeight = 45;
+    const legendHeight = 50;
+    const padding = 20;
+    
+    const width = labelWidth + (days.length * cellWidth) + padding * 2;
+    const height = titleHeight + headerHeight + (24 * cellHeight) + legendHeight + padding * 2;
+    
+    const canvas = createCanvas(width, height);
+    const ctx = canvas.getContext('2d');
+    
+    ctx.fillStyle = '#2C2F33';
+    ctx.fillRect(0, 0, width, height);
+    
+    ctx.fillStyle = '#FFFFFF';
+    ctx.font = 'bold 16px Arial';
+    ctx.textAlign = 'center';
+    ctx.fillText(`Difference: ${title1} vs ${title2}`, width / 2, padding + 25);
+    
+    ctx.font = 'bold 14px Arial';
+    days.forEach((day, i) => {
+        const x = padding + labelWidth + (i * cellWidth) + cellWidth / 2;
+        ctx.fillText(DAY_LABELS[day], x, padding + titleHeight + 30);
+    });
+    
+    let diffMin = Infinity;
+    let diffMax = -Infinity;
+    
+    const diffData = {};
+    for (let hour = 0; hour < 24; hour++) {
+        diffData[hour] = {};
+        for (const day of days) {
+            if (is15Min) {
+                diffData[hour][day] = [];
+                for (let slot = 0; slot < 4; slot++) {
+                    const diff = data1.data[hour][day][slot] - data2.data[hour][day][slot];
+                    diffData[hour][day].push(diff);
+                    if (diff < diffMin) diffMin = diff;
+                    if (diff > diffMax) diffMax = diff;
+                }
+            } else {
+                const diff = data1.data[hour][day] - data2.data[hour][day];
+                diffData[hour][day] = diff;
+                if (diff < diffMin) diffMin = diff;
+                if (diff > diffMax) diffMax = diff;
+            }
+        }
+    }
+    
+    function getDiffColor(value) {
+        const absMax = Math.max(Math.abs(diffMin), Math.abs(diffMax), 1);
+        const ratio = value / absMax;
+        
+        if (ratio < 0) {
+            const t = Math.min(1, Math.abs(ratio));
+            return `rgb(255, ${Math.round(255 * (1 - t))}, ${Math.round(255 * (1 - t))})`;
+        } else {
+            const t = Math.min(1, ratio);
+            return `rgb(${Math.round(255 * (1 - t))}, 255, ${Math.round(255 * (1 - t))})`;
+        }
+    }
+    
+    for (let hour = 0; hour < 24; hour++) {
+        const y = padding + titleHeight + headerHeight + (hour * cellHeight);
+        
+        ctx.fillStyle = '#AAAAAA';
+        ctx.textAlign = 'right';
+        ctx.font = '11px Arial';
+        ctx.fillText(`${hour.toString().padStart(2, '0')}:00`, padding + labelWidth - 8, y + cellHeight / 2 + 4);
+        
+        days.forEach((day, i) => {
+            const x = padding + labelWidth + (i * cellWidth);
+            
+            if (is15Min) {
+                const values = diffData[hour][day];
+                const subWidth = (cellWidth - 4) / 4;
+                
+                for (let slot = 0; slot < 4; slot++) {
+                    const subX = x + 2 + (slot * subWidth);
+                    const val = values[slot];
+                    
+                    ctx.fillStyle = getDiffColor(val);
+                    ctx.fillRect(subX + 1, y + 3, subWidth - 2, cellHeight - 6);
+                    
+                    ctx.fillStyle = '#000000';
+                    ctx.textAlign = 'center';
+                    ctx.font = '8px Arial';
+                    const sign = val > 0 ? '+' : '';
+                    ctx.fillText(`${sign}${Math.round(val)}`, subX + subWidth / 2, y + cellHeight / 2 + 3);
+                }
+            } else {
+                const value = diffData[hour][day];
+                
+                ctx.fillStyle = getDiffColor(value);
+                ctx.fillRect(x + 2, y + 2, cellWidth - 4, cellHeight - 4);
+                
+                ctx.strokeStyle = '#1E2124';
+                ctx.strokeRect(x + 2, y + 2, cellWidth - 4, cellHeight - 4);
+                
+                ctx.fillStyle = '#000000';
+                ctx.textAlign = 'center';
+                ctx.font = '11px Arial';
+                const sign = value > 0 ? '+' : '';
+                ctx.fillText(`${sign}${value.toFixed(1)}`, x + cellWidth / 2, y + cellHeight / 2 + 4);
+            }
+        });
+    }
+    
+    const legendY = height - legendHeight - padding + 15;
+    ctx.fillStyle = '#FFFFFF';
+    ctx.font = '12px Arial';
+    ctx.textAlign = 'center';
+    ctx.fillText(`Green = ${title1} higher | Red = ${title2} higher`, width / 2, legendY + 15);
+    
+    return canvas.toBuffer('image/png');
+}
+
+// ============================================
+// PUBLIC API
+// ============================================
+
+async function createFactionHeatmap(factionId, granularity, dayFilter) {
+    const factionData = storage.loadFactionData(factionId);
+    const snapshots = storage.getSnapshotsNormalized(factionData);
+    
+    if (!snapshots || snapshots.length === 0) {
+        throw new Error(`No data available for faction ${factionId}. Wait for data collection.`);
+    }
+    
+    const title = `${factionData.name || 'Faction'} [${factionId}]`;
+    const numWeeks = getUniqueWeeks(snapshots, Math.floor(Date.now() / 1000));
+    const subtitle = `Last 30 days (${numWeeks} week${numWeeks !== 1 ? 's' : ''} of data) - Avg unique active per hour`;
+    
+    if (granularity === '15min') {
+        const aggregated = aggregateFactionData15Min(factionData, dayFilter);
+        return generateCompact15MinImage(title, aggregated, subtitle);
+    } else {
+        const aggregated = aggregateFactionDataHourly(factionData, dayFilter);
+        return generateHeatmapImage(title, aggregated, subtitle);
+    }
+}
+
+async function createUserHeatmap(userId, granularity, dayFilter) {
+    let aggregated;
+    
+    if (granularity === '15min') {
+        aggregated = aggregateUserData15MinMultiFaction(userId, dayFilter);
+    } else {
+        aggregated = aggregateUserDataHourlyMultiFaction(userId, dayFilter);
+    }
+    
+    if (!aggregated) {
+        throw new Error(`User ${userId} not found in any tracked faction.`);
+    }
+    
+    // Get username
+    const userName = storage.getMemberName(userId) || `User`;
+    const title = `${userName} [${userId}]`;
+    
+    // Calculate data span
+    const factionData = storage.loadFactionData(aggregated.factionIds[0]);
+    const snapshots = storage.getSnapshotsNormalized(factionData);
+    const numWeeks = getUniqueWeeks(snapshots, Math.floor(Date.now() / 1000));
+    
+    const factionInfo = aggregated.factionIds.length > 1 
+        ? `across ${aggregated.factionIds.length} factions` 
+        : '';
+    const subtitle = `Last 30 days (${numWeeks} week${numWeeks !== 1 ? 's' : ''}) - % of time active ${factionInfo}`;
+    
+    if (granularity === '15min') {
+        return generateCompact15MinImage(title, aggregated, subtitle);
+    } else {
+        return generateHeatmapImage(title, aggregated, subtitle);
+    }
+}
+
+async function createComparisonHeatmaps(faction1Id, faction2Id, granularity, dayFilter) {
+    const faction1Data = storage.loadFactionData(faction1Id);
+    const faction2Data = storage.loadFactionData(faction2Id);
+    
+    const snapshots1 = storage.getSnapshotsNormalized(faction1Data);
+    const snapshots2 = storage.getSnapshotsNormalized(faction2Data);
+    
+    if (!snapshots1?.length) {
+        throw new Error(`No data available for faction ${faction1Id}.`);
+    }
+    
+    if (!snapshots2?.length) {
+        throw new Error(`No data available for faction ${faction2Id}.`);
+    }
+    
+    const name1 = faction1Data.name || `Faction ${faction1Id}`;
+    const name2 = faction2Data.name || `Faction ${faction2Id}`;
+    
+    let agg1, agg2;
+    
+    if (granularity === '15min') {
+        agg1 = aggregateFactionData15Min(faction1Data, dayFilter);
+        agg2 = aggregateFactionData15Min(faction2Data, dayFilter);
+    } else {
+        agg1 = aggregateFactionDataHourly(faction1Data, dayFilter);
+        agg2 = aggregateFactionDataHourly(faction2Data, dayFilter);
+    }
+    
+    const sideBySide = generateComparisonImage(name1, agg1, name2, agg2);
+    const difference = generateDifferenceImage(name1, agg1, name2, agg2);
+    
+    return { sideBySide, difference };
+}
+
+module.exports = {
+    createFactionHeatmap,
+    createUserHeatmap,
+    createComparisonHeatmaps
+};
+
+================================================================================
+
+File: src/index.js
+----------------------------------------
+require('dotenv').config();
+
+const { Client, GatewayIntentBits, Collection, REST, Routes } = require('discord.js');
+const collector = require('./collector');
+
+const activityCommand = require('./commands/activity');
+const exportCommand = require('./commands/export');
+
+const client = new Client({ 
+    intents: [GatewayIntentBits.Guilds] 
+});
+
+client.commands = new Collection();
+client.commands.set(activityCommand.data.name, activityCommand);
+client.commands.set(exportCommand.data.name, exportCommand);
+
+async function registerCommands() {
+    const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
+    
+    const commands = [
+        activityCommand.data.toJSON(),
+        exportCommand.data.toJSON()
+    ];
+    
+    try {
+        console.log('Registering slash commands...');
+        
+        await rest.put(
+            Routes.applicationCommands(process.env.DISCORD_CLIENT_ID),
+            { body: commands }
+        );
+        
+        console.log('Slash commands registered successfully.');
+    } catch (error) {
+        console.error('Error registering commands:', error);
+    }
+}
+
+client.once('ready', async () => {
+    console.log(`Logged in as ${client.user.tag}`);
+    
+    await registerCommands();
+    
+    collector.startCollector();
+});
+
+client.on('interactionCreate', async interaction => {
+    if (interaction.isAutocomplete()) {
+        const command = client.commands.get(interaction.commandName);
+        
+        if (!command || !command.autocomplete) return;
+        
+        try {
+            await command.autocomplete(interaction);
+        } catch (error) {
+            console.error('Autocomplete error:', error);
+        }
+        return;
+    }
+    
+    if (!interaction.isChatInputCommand()) return;
+    
+    const command = client.commands.get(interaction.commandName);
+    
+    if (!command) return;
+    
+    try {
+        await command.execute(interaction);
+    } catch (error) {
+        console.error('Command execution error:', error);
+        
+        const errorMessage = { 
+            content: '❌ An error occurred while executing this command.', 
+            ephemeral: true 
+        };
+        
+        if (interaction.replied || interaction.deferred) {
+            await interaction.followUp(errorMessage);
+        } else {
+            await interaction.reply(errorMessage);
+        }
+    }
+});
+
+process.on('SIGINT', () => {
+    console.log('Shutting down...');
+    collector.stopCollector();
+    client.destroy();
+    process.exit(0);
+});
+
+client.login(process.env.DISCORD_TOKEN);
+
+================================================================================
+
+File: src/utils/api.js
+----------------------------------------
+const storage = require('./storage');
+
+const API_BASE = 'https://api.torn.com';
+const MAX_RETRIES = 3;
+const RETRY_DELAY = 1000;
+
+// Rate limiting: 20 calls per minute per key
+const RATE_LIMIT_PER_KEY = 20;
+const RATE_LIMIT_WINDOW = 60 * 1000;
+
+const apiCallLog = new Map();
+
+async function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function cleanOldCalls(key) {
+    const now = Date.now();
+    const calls = apiCallLog.get(key) || [];
+    const recentCalls = calls.filter(t => now - t < RATE_LIMIT_WINDOW);
+    apiCallLog.set(key, recentCalls);
+    return recentCalls;
+}
+
+function getCallCount(key) {
+    return cleanOldCalls(key).length;
+}
+
+function logCall(key) {
+    const calls = apiCallLog.get(key) || [];
+    calls.push(Date.now());
+    apiCallLog.set(key, calls);
+}
+
+function getTimeUntilSlotAvailable(key) {
+    const calls = cleanOldCalls(key);
+    if (calls.length < RATE_LIMIT_PER_KEY) {
+        return 0;
+    }
+    const oldestCall = Math.min(...calls);
+    const timeUntilExpiry = (oldestCall + RATE_LIMIT_WINDOW) - Date.now();
+    return Math.max(0, timeUntilExpiry + 100);
+}
+
+function findAvailableKey(excludeKeys = []) {
+    const config = storage.loadConfig();
+    
+    if (config.apikeys.length === 0) {
+        return { key: null, waitTime: 0 };
+    }
+    
+    const now = Date.now();
+    config.failedKeys = config.failedKeys || {};
+    
+    // Clean up old failures
+    let changed = false;
+    for (const key of Object.keys(config.failedKeys)) {
+        if (now - config.failedKeys[key] > 5 * 60 * 1000) {
+            delete config.failedKeys[key];
+            changed = true;
+        }
+    }
+    if (changed) {
+        storage.saveConfig(config);
+    }
+    
+    // Find available keys
+    const availableKeys = config.apikeys.filter(k => 
+        !excludeKeys.includes(k) && !config.failedKeys[k]
+    );
+    
+    if (availableKeys.length === 0) {
+        if (Object.keys(config.failedKeys).length > 0) {
+            config.failedKeys = {};
+            storage.saveConfig(config);
+            const key = config.apikeys.find(k => !excludeKeys.includes(k));
+            return { key: key || null, waitTime: 0 };
+        }
+        return { key: null, waitTime: 0 };
+    }
+    
+    // Find key with most capacity (lowest usage)
+    let bestKey = null;
+    let lowestWait = Infinity;
+    let lowestUsage = Infinity;
+    
+    for (const key of availableKeys) {
+        const usage = getCallCount(key);
+        const waitTime = getTimeUntilSlotAvailable(key);
+        
+        // Prefer keys that don't need waiting
+        if (waitTime === 0 && usage < lowestUsage) {
+            lowestUsage = usage;
+            bestKey = key;
+            lowestWait = 0;
+        } else if (lowestWait > 0 && waitTime < lowestWait) {
+            // If all keys need waiting, pick the one with shortest wait
+            lowestWait = waitTime;
+            bestKey = key;
+        }
+    }
+    
+    // If no key found without wait, use the one with shortest wait
+    if (!bestKey && availableKeys.length > 0) {
+        bestKey = availableKeys[0];
+        lowestWait = getTimeUntilSlotAvailable(bestKey);
+    }
+    
+    return { key: bestKey, waitTime: lowestWait };
+}
+
+async function fetchWithRetry(url, context = '', usedKeys = [], attempt = 1) {
+    const { key: apiKey, waitTime } = findAvailableKey(usedKeys);
+    
+    if (!apiKey) {
+        throw new Error('No API keys available. All keys may have failed.');
+    }
+    
+    // Wait if needed
+    if (waitTime > 0) {
+        const keyHint = apiKey.slice(-4);
+        const waitSec = Math.ceil(waitTime / 1000);
+        console.log(`[API] Waiting ${waitSec}s for rate limit (key ...${keyHint})${context ? ` - ${context}` : ''}`);
+        await sleep(waitTime);
+    }
+    
+    const separator = url.includes('?') ? '&' : '?';
+    const fullUrl = `${url}${separator}key=${apiKey}`;
+    
+    try {
+        logCall(apiKey);
+        
+        const response = await fetch(fullUrl);
+        
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+        }
+        
+        const data = await response.json();
+        
+        if (data.error) {
+            const errorCode = data.error.code;
+            const errorMsg = data.error.error;
+            
+            if ([1, 2, 10, 13].includes(errorCode)) {
+                console.error(`[API] Key error (${errorCode}): ${errorMsg}. Trying next key...`);
+                storage.markKeyFailed(apiKey);
+                
+                if (attempt < MAX_RETRIES && usedKeys.length + 1 < storage.loadConfig().apikeys.length) {
+                    await sleep(RETRY_DELAY);
+                    return fetchWithRetry(url, context, [...usedKeys, apiKey], attempt + 1);
+                }
+                
+                throw new Error(`All API keys failed. Last error: ${errorMsg}`);
+            }
+            
+            if (errorCode === 5) {
+                console.log('[API] Torn rate limit hit. Waiting 30 seconds...');
+                await sleep(30000);
+                return fetchWithRetry(url, context, usedKeys, attempt);
+            }
+            
+            if (errorCode === 8) {
+                throw new Error('IP is banned from Torn API. Please contact Torn support.');
+            }
+            
+            throw new Error(`Torn API error: ${errorMsg}`);
+        }
+        
+        storage.markKeyWorking(apiKey);
+        return data;
+        
+    } catch (error) {
+        if (error.message.includes('fetch') || 
+            error.message.includes('network') || 
+            error.message.includes('ETIMEDOUT') ||
+            error.message.includes('ECONNREFUSED') ||
+            error.message.includes('ENOTFOUND')) {
+            
+            console.error(`[API] Network error: ${error.message}. Trying next key...`);
+            storage.markKeyFailed(apiKey);
+            
+            if (attempt < MAX_RETRIES) {
+                await sleep(RETRY_DELAY);
+                return fetchWithRetry(url, context, [...usedKeys, apiKey], attempt + 1);
+            }
+        }
+        
+        throw error;
+    }
+}
+
+async function fetchFaction(factionId) {
+    const url = `${API_BASE}/faction/${factionId}?selections=basic`;
+    return fetchWithRetry(url, `Faction ${factionId}`);
+}
+
+async function fetchHOFPage(offset = 0, limit = 100) {
+    const url = `${API_BASE}/v2/torn/factionhof?cat=rank&limit=${limit}&offset=${offset}`;
+    return fetchWithRetry(url, `HOF page offset=${offset}`);
+}
+
+async function fetchAllHOF(progressCallback = null) {
+    const allFactions = [];
+    let offset = 0;
+    const limit = 100;
+    let hasMore = true;
+    let page = 0;
+    
+    while (hasMore) {
+        page++;
+        if (progressCallback) {
+            progressCallback(page, allFactions.length);
+        }
+        
+        const data = await fetchHOFPage(offset, limit);
+        
+        if (!data.factionhof || data.factionhof.length === 0) {
+            hasMore = false;
+        } else {
+            allFactions.push(...data.factionhof);
+            offset += limit;
+            
+            if (!data._metadata?.links?.next) {
+                hasMore = false;
+            }
+            
+            if (allFactions.length >= 5000) {
+                hasMore = false;
+            }
+            
+            // Delay between pages
+            await sleep(500);
+        }
+    }
+    
+    return allFactions;
+}
+
+function processActivitySnapshot(factionData, pollTimestamp) {
+    const activeMembers = [];
+    const allMemberIds = [];
+    const members = factionData.members || {};
+    
+    for (const [memberId, memberData] of Object.entries(members)) {
+        const id = parseInt(memberId);
+        allMemberIds.push(id);
+        
+        const lastAction = memberData.last_action?.timestamp || 0;
+        const timeDiff = pollTimestamp - lastAction;
+        
+        if (timeDiff <= 900) {
+            activeMembers.push(id);
+        }
+    }
+    
+    return {
+        active: activeMembers,
+        total: Object.keys(members).length,
+        allMemberIds,
+        members
+    };
+}
+
+function getRateLimitStatus() {
+    const config = storage.loadConfig();
+    const status = {};
+    
+    for (const key of config.apikeys) {
+        const masked = `...${key.slice(-4)}`;
+        const calls = getCallCount(key);
+        const isFailed = config.failedKeys && config.failedKeys[key];
+        
+        status[masked] = {
+            calls,
+            limit: RATE_LIMIT_PER_KEY,
+            available: RATE_LIMIT_PER_KEY - calls,
+            failed: !!isFailed
+        };
+    }
+    
+    return status;
+}
+
+function estimateCollectionTime(factionCount) {
+    const config = storage.loadConfig();
+    const keyCount = config.apikeys.length;
+    
+    if (keyCount === 0) return Infinity;
+    
+    const totalCallsPerMinute = keyCount * RATE_LIMIT_PER_KEY;
+    const minutes = factionCount / totalCallsPerMinute;
+    
+    return Math.ceil(minutes * 60);
+}
+
+// Clear rate limit tracking (useful for debugging)
+function clearRateLimitLog() {
+    apiCallLog.clear();
+    console.log('[API] Rate limit log cleared');
+}
+
+module.exports = {
+    fetchFaction,
+    fetchHOFPage,
+    fetchAllHOF,
+    processActivitySnapshot,
+    getRateLimitStatus,
+    estimateCollectionTime,
+    clearRateLimitLog,
+    RATE_LIMIT_PER_KEY
+};
+
+================================================================================
+
+File: src/utils/helpers.js
+----------------------------------------
+const DAY_NAMES = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'];
+const DAY_LABELS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+
+function parseDaysFilter(daysInput) {
+    if (!daysInput || daysInput === 'all') {
+        return [0, 1, 2, 3, 4, 5, 6];
+    }
+    
+    if (daysInput === 'weekday') {
+        return [1, 2, 3, 4, 5];
+    }
+    
+    if (daysInput === 'weekend') {
+        return [0, 6];
+    }
+    
+    const days = daysInput.toLowerCase().split(',').map(d => d.trim());
+    const indices = [];
+    
+    for (const day of days) {
+        const index = DAY_NAMES.indexOf(day);
+        if (index !== -1 && !indices.includes(index)) {
+            indices.push(index);
+        }
+    }
+    
+    return indices.length > 0 ? indices.sort((a, b) => a - b) : [0, 1, 2, 3, 4, 5, 6];
+}
+
+function getHourFromTimestamp(timestamp) {
+    const date = new Date(timestamp * 1000);
+    return date.getUTCHours();
+}
+
+function get15MinSlotInHour(timestamp) {
+    const date = new Date(timestamp * 1000);
+    return Math.floor(date.getUTCMinutes() / 15);
+}
+
+function getDayOfWeek(timestamp) {
+    const date = new Date(timestamp * 1000);
+    return date.getUTCDay();
+}
+
+function formatTimeSlot(index, granularity) {
+    if (granularity === '15min') {
+        const hours = Math.floor(index / 4);
+        const minutes = (index % 4) * 15;
+        return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}`;
+    }
+    
+    return `${index.toString().padStart(2, '0')}:00`;
+}
+
+function getThirtyDaysAgo() {
+    return Math.floor(Date.now() / 1000) - (30 * 24 * 60 * 60);
+}
+
+function getWeekId(timestamp, referenceTimestamp) {
+    const refDate = new Date(referenceTimestamp * 1000);
+    const targetDate = new Date(timestamp * 1000);
+    
+    // Get start of week (Sunday) for reference
+    const refWeekStart = new Date(refDate);
+    refWeekStart.setUTCHours(0, 0, 0, 0);
+    refWeekStart.setUTCDate(refWeekStart.getUTCDate() - refWeekStart.getUTCDay());
+    
+    // Get start of week for target
+    const targetWeekStart = new Date(targetDate);
+    targetWeekStart.setUTCHours(0, 0, 0, 0);
+    targetWeekStart.setUTCDate(targetWeekStart.getUTCDate() - targetWeekStart.getUTCDay());
+    
+    const diffMs = refWeekStart.getTime() - targetWeekStart.getTime();
+    const diffWeeks = Math.floor(diffMs / (7 * 24 * 60 * 60 * 1000));
+    
+    return diffWeeks;
+}
+
+function getUniqueWeeks(snapshots, referenceTimestamp) {
+    const weeks = new Set();
+    for (const snapshot of snapshots) {
+        const timestamp = snapshot.t || snapshot.timestamp;
+        weeks.add(getWeekId(timestamp, referenceTimestamp));
+    }
+    return weeks.size;
+}
+
+module.exports = {
+    DAY_NAMES,
+    DAY_LABELS,
+    parseDaysFilter,
+    getHourFromTimestamp,
+    get15MinSlotInHour,
+    getDayOfWeek,
+    formatTimeSlot,
+    getThirtyDaysAgo,
+    getWeekId,
+    getUniqueWeeks
+};
+
+================================================================================
+
+File: src/utils/storage.js
+----------------------------------------
+const fs = require('fs');
+const path = require('path');
+
+const CONFIG_PATH = path.join(__dirname, '../../config.json');
+const DATA_DIR = path.join(__dirname, '../../data');
+const USER_INDEX_PATH = path.join(DATA_DIR, 'user_index.json');
+const MEMBER_NAMES_PATH = path.join(DATA_DIR, 'member_names.json');
+
+// Cache for frequently accessed data
+// NOTE: This is RAM cache only - disk storage is unlimited
+const cache = {
+    config: null,
+    configMtime: 0,
+    userIndex: null,
+    userIndexMtime: 0,
+    memberNames: null,
+    memberNamesMtime: 0,
+    factionData: new Map(), // factionId -> { data, mtime, lastAccess }
+    maxCacheSize: 100 // Max factions to keep in RAM (not disk limit!)
+};
+
+function ensureDataDir() {
+    if (!fs.existsSync(DATA_DIR)) {
+        fs.mkdirSync(DATA_DIR, { recursive: true });
+    }
+}
+
+// ============================================
+// CONFIG
+// ============================================
+
+function loadConfig() {
+    try {
+        const stats = fs.statSync(CONFIG_PATH);
+        if (cache.config && cache.configMtime === stats.mtimeMs) {
+            return cache.config;
+        }
+        
+        const data = fs.readFileSync(CONFIG_PATH, 'utf8');
+        cache.config = JSON.parse(data);
+        cache.configMtime = stats.mtimeMs;
+        return cache.config;
+    } catch (error) {
+        return { factions: [], apikeys: [], currentKeyIndex: 0, failedKeys: {} };
+    }
+}
+
+function saveConfig(config) {
+    cache.config = config;
+    cache.configMtime = Date.now();
+    fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2));
+}
+
+// ============================================
+// API KEY MANAGEMENT
+// ============================================
+
+function markKeyFailed(key) {
+    const config = loadConfig();
+    config.failedKeys = config.failedKeys || {};
+    config.failedKeys[key] = Date.now();
+    saveConfig(config);
+}
+
+function markKeyWorking(key) {
+    const config = loadConfig();
+    if (config.failedKeys && config.failedKeys[key]) {
+        delete config.failedKeys[key];
+        saveConfig(config);
+    }
+}
+
+// ============================================
+// MEMBER NAMES
+// ============================================
+
+function loadMemberNames() {
+    ensureDataDir();
+    
+    try {
+        const stats = fs.statSync(MEMBER_NAMES_PATH);
+        if (cache.memberNames && cache.memberNamesMtime === stats.mtimeMs) {
+            return cache.memberNames;
+        }
+        
+        const data = fs.readFileSync(MEMBER_NAMES_PATH, 'utf8');
+        cache.memberNames = JSON.parse(data);
+        cache.memberNamesMtime = stats.mtimeMs;
+        return cache.memberNames;
+    } catch (error) {
+        return {};
+    }
+}
+
+function saveMemberNames(names) {
+    ensureDataDir();
+    cache.memberNames = names;
+    cache.memberNamesMtime = Date.now();
+    fs.writeFileSync(MEMBER_NAMES_PATH, JSON.stringify(names));
+}
+
+function updateMemberNames(members) {
+    const names = loadMemberNames();
+    let changed = false;
+    
+    for (const [id, data] of Object.entries(members)) {
+        if (data.name && names[id] !== data.name) {
+            names[id] = data.name;
+            changed = true;
+        }
+    }
+    
+    if (changed) {
+        saveMemberNames(names);
+    }
+}
+
+function getMemberName(userId) {
+    const names = loadMemberNames();
+    return names[userId] || null;
+}
+
+// ============================================
+// USER INDEX
+// ============================================
+
+function loadUserIndex() {
+    ensureDataDir();
+    
+    try {
+        const stats = fs.statSync(USER_INDEX_PATH);
+        if (cache.userIndex && cache.userIndexMtime === stats.mtimeMs) {
+            return cache.userIndex;
+        }
+        
+        const data = fs.readFileSync(USER_INDEX_PATH, 'utf8');
+        cache.userIndex = JSON.parse(data);
+        cache.userIndexMtime = stats.mtimeMs;
+        return cache.userIndex;
+    } catch (error) {
+        return {};
+    }
+}
+
+function saveUserIndex(index) {
+    ensureDataDir();
+    cache.userIndex = index;
+    cache.userIndexMtime = Date.now();
+    fs.writeFileSync(USER_INDEX_PATH, JSON.stringify(index));
+}
+
+function updateUserIndex(factionId, memberIds) {
+    const index = loadUserIndex();
+    let changed = false;
+    
+    for (const memberId of memberIds) {
+        const id = memberId.toString();
+        if (!index[id]) {
+            index[id] = [];
+        }
+        if (!index[id].includes(factionId)) {
+            index[id].push(factionId);
+            changed = true;
+        }
+    }
+    
+    if (changed) {
+        saveUserIndex(index);
+    }
+}
+
+function getUserFactions(userId) {
+    const index = loadUserIndex();
+    return index[userId.toString()] || [];
+}
+
+// ============================================
+// FACTION DATA
+// ============================================
+
+function getFactionDataPath(factionId) {
+    return path.join(DATA_DIR, `faction_${factionId}.json`);
+}
+
+function evictOldestFromCache() {
+    if (cache.factionData.size < cache.maxCacheSize) return;
+    
+    // Find least recently accessed
+    let oldestKey = null;
+    let oldestTime = Infinity;
+    
+    for (const [key, value] of cache.factionData) {
+        if (value.lastAccess < oldestTime) {
+            oldestTime = value.lastAccess;
+            oldestKey = key;
+        }
+    }
+    
+    if (oldestKey !== null) {
+        cache.factionData.delete(oldestKey);
+    }
+}
+
+function loadFactionData(factionId, useCache = true) {
+    ensureDataDir();
+    const filePath = getFactionDataPath(factionId);
+    
+    try {
+        const stats = fs.statSync(filePath);
+        
+        if (useCache) {
+            const cached = cache.factionData.get(factionId);
+            if (cached && cached.mtime === stats.mtimeMs) {
+                cached.lastAccess = Date.now();
+                return cached.data;
+            }
+        }
+        
+        const data = fs.readFileSync(filePath, 'utf8');
+        const parsed = JSON.parse(data);
+        
+        // Manage cache size (LRU eviction)
+        evictOldestFromCache();
+        
+        cache.factionData.set(factionId, { 
+            data: parsed, 
+            mtime: stats.mtimeMs,
+            lastAccess: Date.now()
+        });
+        
+        return parsed;
+    } catch (error) {
+        return {
+            factionId: factionId,
+            name: null,
+            snapshots: []
+        };
+    }
+}
+
+function saveFactionData(factionId, data) {
+    ensureDataDir();
+    const filePath = getFactionDataPath(factionId);
+    
+    // Update cache
+    cache.factionData.set(factionId, { 
+        data, 
+        mtime: Date.now(),
+        lastAccess: Date.now()
+    });
+    
+    // Write to file (compact JSON, no formatting)
+    fs.writeFileSync(filePath, JSON.stringify(data));
+}
+
+function addSnapshot(factionId, factionName, timestamp, activeMembers, totalMembers, allMemberIds) {
+    const data = loadFactionData(factionId, false);
+    data.name = factionName;
+    
+    // Use compact format
+    data.snapshots.push({
+        t: timestamp,
+        a: activeMembers,
+        n: totalMembers
+    });
+    
+    // Prune old data (older than 30 days)
+    const thirtyDaysAgo = Math.floor(Date.now() / 1000) - (30 * 24 * 60 * 60);
+    data.snapshots = data.snapshots.filter(s => (s.t || s.timestamp) >= thirtyDaysAgo);
+    
+    saveFactionData(factionId, data);
+    
+    // Update user index with all members
+    if (allMemberIds && allMemberIds.length > 0) {
+        updateUserIndex(factionId, allMemberIds);
+    }
+}
+
+// Normalize snapshot format (handle both old and new formats)
+function normalizeSnapshot(snapshot) {
+    return {
+        timestamp: snapshot.t || snapshot.timestamp,
+        active: snapshot.a || snapshot.active || [],
+        total: snapshot.n || snapshot.total || 0
+    };
+}
+
+function getSnapshotsNormalized(factionData) {
+    return (factionData.snapshots || []).map(normalizeSnapshot);
+}
+
+// ============================================
+// MULTI-FACTION SEARCH
+// ============================================
+
+function findUserInAllFactions(userId) {
+    const factionIds = getUserFactions(userId);
+    
+    if (factionIds.length === 0) {
+        // Fallback: scan all faction files (slower, but needed for initial index building)
+        return scanAllFactionsForUser(userId);
+    }
+    
+    return factionIds;
+}
+
+function scanAllFactionsForUser(userId) {
+    ensureDataDir();
+    const files = fs.readdirSync(DATA_DIR).filter(f => 
+        f.startsWith('faction_') && f.endsWith('.json')
+    );
+    
+    const foundFactions = [];
+    
+    for (const file of files) {
+        const match = file.match(/faction_(\d+)\.json/);
+        if (!match) continue;
+        
+        const factionId = parseInt(match[1]);
+        const data = loadFactionData(factionId);
+        const snapshots = getSnapshotsNormalized(data);
+        
+        for (const snapshot of snapshots) {
+            if (snapshot.active.includes(userId)) {
+                foundFactions.push(factionId);
+                break;
+            }
+        }
+    }
+    
+    // Update index for future lookups
+    if (foundFactions.length > 0) {
+        const index = loadUserIndex();
+        index[userId.toString()] = foundFactions;
+        saveUserIndex(index);
+    }
+    
+    return foundFactions;
+}
+
+function getAllTrackedFactionIds() {
+    ensureDataDir();
+    const files = fs.readdirSync(DATA_DIR).filter(f => 
+        f.startsWith('faction_') && f.endsWith('.json')
+    );
+    
+    return files.map(f => {
+        const match = f.match(/faction_(\d+)\.json/);
+        return match ? parseInt(match[1]) : null;
+    }).filter(id => id !== null);
+}
+
+function getAllFactionData() {
+    const factionIds = getAllTrackedFactionIds();
+    const factions = {};
+    
+    for (const factionId of factionIds) {
+        factions[factionId] = loadFactionData(factionId);
+    }
+    
+    return factions;
+}
+
+// Get basic stats without loading all data
+function getFactionStats() {
+    ensureDataDir();
+    const config = loadConfig();
+    const stats = {
+        configured: config.factions.length,
+        withData: 0,
+        totalSnapshots: 0
+    };
+    
+    const files = fs.readdirSync(DATA_DIR).filter(f => 
+        f.startsWith('faction_') && f.endsWith('.json')
+    );
+    
+    stats.withData = files.length;
+    
+    return stats;
+}
+
+// ============================================
+// CLEANUP
+// ============================================
+
+function clearCache() {
+    cache.config = null;
+    cache.userIndex = null;
+    cache.memberNames = null;
+    cache.factionData.clear();
+}
+
+// ============================================
+// NAME SEARCH
+// ============================================
+
+function searchFactionByName(query) {
+    const config = loadConfig();
+    const results = [];
+    const q = query.toLowerCase().trim();
+    
+    for (const factionId of config.factions) {
+        const data = loadFactionData(factionId);
+        const name = data.name || `Faction ${factionId}`;
+        
+        if (name.toLowerCase().includes(q) || factionId.toString().includes(q)) {
+            results.push({
+                id: factionId,
+                name: name
+            });
+        }
+    }
+    
+    // Sort by relevance (exact match first, then starts with, then contains)
+    results.sort((a, b) => {
+        const aLower = a.name.toLowerCase();
+        const bLower = b.name.toLowerCase();
+        
+        const aExact = aLower === q;
+        const bExact = bLower === q;
+        if (aExact && !bExact) return -1;
+        if (bExact && !aExact) return 1;
+        
+        const aStarts = aLower.startsWith(q);
+        const bStarts = bLower.startsWith(q);
+        if (aStarts && !bStarts) return -1;
+        if (bStarts && !aStarts) return 1;
+        
+        return a.name.localeCompare(b.name);
+    });
+    
+    return results.slice(0, 25); // Discord limit
+}
+
+function searchMemberByName(query) {
+    const names = loadMemberNames();
+    const results = [];
+    const q = query.toLowerCase().trim();
+    
+    for (const [id, name] of Object.entries(names)) {
+        if (name.toLowerCase().includes(q) || id.includes(q)) {
+            results.push({
+                id: parseInt(id),
+                name: name
+            });
+        }
+    }
+    
+    // Sort by relevance
+    results.sort((a, b) => {
+        const aLower = a.name.toLowerCase();
+        const bLower = b.name.toLowerCase();
+        
+        const aExact = aLower === q;
+        const bExact = bLower === q;
+        if (aExact && !bExact) return -1;
+        if (bExact && !aExact) return 1;
+        
+        const aStarts = aLower.startsWith(q);
+        const bStarts = bLower.startsWith(q);
+        if (aStarts && !bStarts) return -1;
+        if (bStarts && !aStarts) return 1;
+        
+        return a.name.localeCompare(b.name);
+    });
+    
+    return results.slice(0, 25);
+}
+
+function resolveFaction(input) {
+    // If it's a number, use as ID
+    const asNumber = parseInt(input);
+    if (!isNaN(asNumber) && asNumber.toString() === input.trim()) {
+        const data = loadFactionData(asNumber);
+        return {
+            id: asNumber,
+            name: data.name || `Faction ${asNumber}`
+        };
+    }
+    
+    // Search by name
+    const results = searchFactionByName(input);
+    if (results.length === 0) {
+        return null;
+    }
+    
+    // Return exact match if exists, otherwise first result
+    const exact = results.find(r => r.name.toLowerCase() === input.toLowerCase());
+    return exact || results[0];
+}
+
+function resolveMember(input) {
+    // If it's a number, use as ID
+    const asNumber = parseInt(input);
+    if (!isNaN(asNumber) && asNumber.toString() === input.trim()) {
+        const name = getMemberName(asNumber);
+        return {
+            id: asNumber,
+            name: name || `User ${asNumber}`
+        };
+    }
+    
+    // Search by name
+    const results = searchMemberByName(input);
+    if (results.length === 0) {
+        return null;
+    }
+    
+    const exact = results.find(r => r.name.toLowerCase() === input.toLowerCase());
+    return exact || results[0];
+}
+
+function getAllFactionChoices() {
+    const config = loadConfig();
+    const choices = [];
+    
+    for (const factionId of config.factions) {
+        const data = loadFactionData(factionId);
+        const name = data.name || `Faction ${factionId}`;
+        choices.push({
+            name: `${name} [${factionId}]`,
+            value: factionId.toString()
+        });
+    }
+    
+    return choices.slice(0, 25);
+}
+
+function getAllMemberChoices() {
+    const names = loadMemberNames();
+    const choices = [];
+    
+    for (const [id, name] of Object.entries(names)) {
+        choices.push({
+            name: `${name} [${id}]`,
+            value: id
+        });
+    }
+    
+    return choices.slice(0, 25);
+}
+
+// ============================================
+// RANK-BASED FACTION MANAGEMENT
+// ============================================
+
+function addFactionsByRank(rankName, minMembers = null, maxMembers = null) {
+    const hof = require('./hof');
+    const factions = hof.getFactionsbyRank(rankName, minMembers, maxMembers);
+    
+    if (factions.length === 0) {
+        return { added: 0, skipped: 0, factions: [] };
+    }
+    
+    const config = loadConfig();
+    let added = 0;
+    let skipped = 0;
+    const addedFactions = [];
+    
+    for (const faction of factions) {
+        if (!config.factions.includes(faction.id)) {
+            config.factions.push(faction.id);
+            addedFactions.push(faction);
+            added++;
+        } else {
+            skipped++;
+        }
+    }
+    
+    if (added > 0) {
+        saveConfig(config);
+    }
+    
+    return { added, skipped, factions: addedFactions };
+}
+
+function removeFactionsByRank(rankName, minMembers = null, maxMembers = null) {
+    const hof = require('./hof');
+    const factions = hof.getFactionsbyRank(rankName, minMembers, maxMembers);
+    
+    if (factions.length === 0) {
+        return { removed: 0, factions: [] };
+    }
+    
+    const config = loadConfig();
+    const factionIds = factions.map(f => f.id);
+    const initialLength = config.factions.length;
+    const removedFactions = [];
+    
+    config.factions = config.factions.filter(id => {
+        if (factionIds.includes(id)) {
+            const faction = factions.find(f => f.id === id);
+            if (faction) removedFactions.push(faction);
+            return false;
+        }
+        return true;
+    });
+    
+    const removed = initialLength - config.factions.length;
+    
+    if (removed > 0) {
+        saveConfig(config);
+    }
+    
+    return { removed, factions: removedFactions };
+}
+
+function addFactionsByIds(ids) {
+    const config = loadConfig();
+    let added = 0;
+    let skipped = 0;
+    
+    for (const id of ids) {
+        if (!config.factions.includes(id)) {
+            config.factions.push(id);
+            added++;
+        } else {
+            skipped++;
+        }
+    }
+    
+    if (added > 0) {
+        saveConfig(config);
+    }
+    
+    return { added, skipped };
+}
+
+function removeFactionsByIds(ids) {
+    const config = loadConfig();
+    const initialLength = config.factions.length;
+    
+    config.factions = config.factions.filter(id => !ids.includes(id));
+    
+    const removed = initialLength - config.factions.length;
+    
+    if (removed > 0) {
+        saveConfig(config);
+    }
+    
+    return { removed };
+}
+
+function addApiKeys(keys) {
+    const config = loadConfig();
+    let added = 0;
+    let skipped = 0;
+    
+    for (const key of keys) {
+        if (!config.apikeys.includes(key)) {
+            config.apikeys.push(key);
+            added++;
+        } else {
+            skipped++;
+        }
+    }
+    
+    if (added > 0) {
+        saveConfig(config);
+    }
+    
+    return { added, skipped };
+}
+
+function removeApiKey(key) {
+    const config = loadConfig();
+    const index = config.apikeys.indexOf(key);
+    
+    if (index === -1) {
+        return { removed: false };
+    }
+    
+    config.apikeys.splice(index, 1);
+    
+    if (config.currentKeyIndex >= config.apikeys.length) {
+        config.currentKeyIndex = 0;
+    }
+    
+    saveConfig(config);
+    
+    return { removed: true };
+}
+
+module.exports = {
+    loadConfig,
+    saveConfig,
+    markKeyFailed,
+    markKeyWorking,
+    loadFactionData,
+    saveFactionData,
+    addSnapshot,
+    getSnapshotsNormalized,
+    normalizeSnapshot,
+    loadMemberNames,
+    updateMemberNames,
+    getMemberName,
+    loadUserIndex,
+    getUserFactions,
+    updateUserIndex,
+    findUserInAllFactions,
+    getAllFactionData,
+    getAllTrackedFactionIds,
+    getFactionStats,
+    clearCache,
+    searchFactionByName,
+    searchMemberByName,
+    resolveFaction,
+    resolveMember,
+    getAllFactionChoices,
+    getAllMemberChoices,
+    // New exports
+    addFactionsByRank,
+    removeFactionsByRank,
+    addFactionsByIds,
+    removeFactionsByIds,
+    addApiKeys,
+    removeApiKey
+};
+
+================================================================================
+
+File: config.json
+----------------------------------------
+{
+  "factions": [
+    47878,
+    8677
+  ],
+  "apikeys": [
+    "r8ixcUfQoiLgx7Uo"
+  ],
+  "currentKeyIndex": 0
+}
+
+================================================================================
+
+File: src/export/generator.js
+----------------------------------------
+const storage = require('../utils/storage');
+const helpers = require('../utils/helpers');
+
+const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+
+// ============================================
+// DATA AGGREGATION (same logic as web routes)
+// ============================================
+
+function aggregateHeatmapData(snapshots, granularity) {
+    const now = Math.floor(Date.now() / 1000);
+    const thirtyDaysAgo = helpers.getThirtyDaysAgo();
+    
+    if (granularity === '15min') {
+        const data = {};
+        for (let hour = 0; hour < 24; hour++) {
+            data[hour] = {};
+            for (let day = 0; day < 7; day++) {
+                data[hour][day] = [
+                    { weeklyUnique: {} },
+                    { weeklyUnique: {} },
+                    { weeklyUnique: {} },
+                    { weeklyUnique: {} }
+                ];
+            }
+        }
+        
+        for (const snapshot of snapshots) {
+            if (snapshot.timestamp < thirtyDaysAgo) continue;
+            
+            const day = helpers.getDayOfWeek(snapshot.timestamp);
+            const hour = helpers.getHourFromTimestamp(snapshot.timestamp);
+            const slot = helpers.get15MinSlotInHour(snapshot.timestamp);
+            const weekId = helpers.getWeekId(snapshot.timestamp, now);
+            
+            if (!data[hour][day][slot].weeklyUnique[weekId]) {
+                data[hour][day][slot].weeklyUnique[weekId] = new Set();
+            }
+            
+            for (const memberId of snapshot.active) {
+                data[hour][day][slot].weeklyUnique[weekId].add(memberId);
+            }
+        }
+        
+        const result = [];
+        let min = Infinity, max = -Infinity;
+        
+        for (let hour = 0; hour < 24; hour++) {
+            const row = [];
+            for (let day = 0; day < 7; day++) {
+                const slots = [];
+                for (let slot = 0; slot < 4; slot++) {
+                    const weekData = data[hour][day][slot].weeklyUnique;
+                    const weekIds = Object.keys(weekData);
+                    
+                    let avg = 0;
+                    if (weekIds.length > 0) {
+                        let total = 0;
+                        for (const wid of weekIds) {
+                            total += weekData[wid].size;
+                        }
+                        avg = Math.round(total / weekIds.length * 10) / 10;
+                    }
+                    
+                    slots.push(avg);
+                    if (avg < min) min = avg;
+                    if (avg > max) max = avg;
+                }
+                row.push(slots);
+            }
+            result.push(row);
+        }
+        
+        return { data: result, min, max, is15Min: true };
+    } else {
+        const data = {};
+        for (let hour = 0; hour < 24; hour++) {
+            data[hour] = {};
+            for (let day = 0; day < 7; day++) {
+                data[hour][day] = {};
+            }
+        }
+        
+        for (const snapshot of snapshots) {
+            if (snapshot.timestamp < thirtyDaysAgo) continue;
+            
+            const day = helpers.getDayOfWeek(snapshot.timestamp);
+            const hour = helpers.getHourFromTimestamp(snapshot.timestamp);
+            const weekId = helpers.getWeekId(snapshot.timestamp, now);
+            
+            if (!data[hour][day][weekId]) {
+                data[hour][day][weekId] = new Set();
+            }
+            
+            for (const memberId of snapshot.active) {
+                data[hour][day][weekId].add(memberId);
+            }
+        }
+        
+        const result = [];
+        let min = Infinity, max = -Infinity;
+        
+        for (let hour = 0; hour < 24; hour++) {
+            const row = [];
+            for (let day = 0; day < 7; day++) {
+                const weekData = data[hour][day];
+                const weekIds = Object.keys(weekData);
+                
+                let avg = 0;
+                if (weekIds.length > 0) {
+                    let total = 0;
+                    for (const wid of weekIds) {
+                        total += weekData[wid].size;
+                    }
+                    avg = Math.round(total / weekIds.length * 10) / 10;
+                }
+                
+                row.push(avg);
+                if (avg < min) min = avg;
+                if (avg > max) max = avg;
+            }
+            result.push(row);
+        }
+        
+        return { data: result, min: min === Infinity ? 0 : min, max: max === -Infinity ? 0 : max };
+    }
+}
+
+function aggregateMemberHeatmapData(snapshots, memberId, granularity) {
+    const thirtyDaysAgo = helpers.getThirtyDaysAgo();
+    const now = Math.floor(Date.now() / 1000);
+    
+    if (granularity === '15min') {
+        const data = {};
+        for (let hour = 0; hour < 24; hour++) {
+            data[hour] = {};
+            for (let day = 0; day < 7; day++) {
+                data[hour][day] = [
+                    { total: 0, active: 0 },
+                    { total: 0, active: 0 },
+                    { total: 0, active: 0 },
+                    { total: 0, active: 0 }
+                ];
+            }
+        }
+        
+        const processed = new Set();
+        
+        for (const snapshot of snapshots) {
+            if (snapshot.timestamp < thirtyDaysAgo) continue;
+            
+            const key = snapshot.timestamp.toString();
+            if (processed.has(key)) continue;
+            processed.add(key);
+            
+            const day = helpers.getDayOfWeek(snapshot.timestamp);
+            const hour = helpers.getHourFromTimestamp(snapshot.timestamp);
+            const slot = helpers.get15MinSlotInHour(snapshot.timestamp);
+            
+            data[hour][day][slot].total++;
+            if (snapshot.active.includes(memberId)) {
+                data[hour][day][slot].active++;
+            }
+        }
+        
+        const result = [];
+        for (let hour = 0; hour < 24; hour++) {
+            const row = [];
+            for (let day = 0; day < 7; day++) {
+                const slots = [];
+                for (let slot = 0; slot < 4; slot++) {
+                    const { total, active } = data[hour][day][slot];
+                    slots.push(total === 0 ? 0 : Math.round((active / total) * 100));
+                }
+                row.push(slots);
+            }
+            result.push(row);
+        }
+        
+        return { data: result, min: 0, max: 100, isPercentage: true, is15Min: true };
+    } else {
+        const data = {};
+        for (let hour = 0; hour < 24; hour++) {
+            data[hour] = {};
+            for (let day = 0; day < 7; day++) {
+                data[hour][day] = { weeksWithData: new Set(), weeksActive: new Set() };
+            }
+        }
+        
+        for (const snapshot of snapshots) {
+            if (snapshot.timestamp < thirtyDaysAgo) continue;
+            
+            const day = helpers.getDayOfWeek(snapshot.timestamp);
+            const hour = helpers.getHourFromTimestamp(snapshot.timestamp);
+            const weekId = `${snapshot.factionId || 0}-${helpers.getWeekId(snapshot.timestamp, now)}`;
+            
+            data[hour][day].weeksWithData.add(weekId);
+            if (snapshot.active.includes(memberId)) {
+                data[hour][day].weeksActive.add(weekId);
+            }
+        }
+        
+        const result = [];
+        for (let hour = 0; hour < 24; hour++) {
+            const row = [];
+            for (let day = 0; day < 7; day++) {
+                const { weeksWithData, weeksActive } = data[hour][day];
+                const pct = weeksWithData.size === 0 ? 0 : Math.round((weeksActive.size / weeksWithData.size) * 100);
+                row.push(pct);
+            }
+            result.push(row);
+        }
+        
+        return { data: result, min: 0, max: 100, isPercentage: true };
+    }
+}
+
+function calculateMemberStats(snapshots, memberId) {
+    const thirtyDaysAgo = helpers.getThirtyDaysAgo();
+    const sevenDaysAgo = Math.floor(Date.now() / 1000) - (7 * 24 * 60 * 60);
+    
+    let total30d = 0, active30d = 0;
+    let total7d = 0, active7d = 0;
+    
+    const processed = new Set();
+    
+    for (const snapshot of snapshots) {
+        const key = snapshot.timestamp.toString();
+        if (processed.has(key)) continue;
+        processed.add(key);
+        
+        if (snapshot.timestamp >= thirtyDaysAgo) {
+            total30d++;
+            if (snapshot.active.includes(memberId)) active30d++;
+        }
+        
+        if (snapshot.timestamp >= sevenDaysAgo) {
+            total7d++;
+            if (snapshot.active.includes(memberId)) active7d++;
+        }
+    }
+    
+    return {
+        activityScore: total30d === 0 ? 0 : Math.round((active30d / total30d) * 100),
+        activity7d: total7d === 0 ? 0 : Math.round((active7d / total7d) * 100),
+        activity30d: total30d === 0 ? 0 : Math.round((active30d / total30d) * 100)
+    };
+}
+
+// ============================================
+// HTML TEMPLATE
+// ============================================
+
+function getBaseHTML(title, content, data) {
+    const generatedAt = new Date().toISOString();
+    
+    return `<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>${escapeHtml(title)} - Torn Activity Report</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>${getCSS()}</style>
+</head>
+<body>
+    <div class="container">
+        <header class="header">
+            <div class="brand">
+                <span class="brand-icon">📊</span>
+                <span class="brand-text">Torn Activity Report</span>
+            </div>
+            <div class="generated">Generated: ${generatedAt}</div>
+        </header>
+        
+        ${content}
+        
+        <footer class="footer">
+            <p>Generated by Torn Activity Bot</p>
+        </footer>
+    </div>
+    
+    <script>
+        const DATA = ${JSON.stringify(data)};
+        ${getJS()}
+    </script>
+</body>
+</html>`;
+}
+
+function getCSS() {
+    return `
+:root {
+    --bg-primary: #09090b;
+    --bg-secondary: #18181b;
+    --bg-tertiary: #27272a;
+    --bg-hover: #3f3f46;
+    --text-primary: #fafafa;
+    --text-secondary: #a1a1aa;
+    --text-muted: #52525b;
+    --accent: #8b5cf6;
+    --success: #10b981;
+    --warning: #f59e0b;
+    --danger: #ef4444;
+    --border: rgba(255, 255, 255, 0.1);
+}
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    line-height: 1.6;
+    min-height: 100vh;
+    background-image: 
+        radial-gradient(ellipse 80% 50% at 50% -20%, rgba(139, 92, 246, 0.15), transparent),
+        radial-gradient(ellipse 60% 40% at 100% 100%, rgba(34, 211, 238, 0.1), transparent);
+}
+
+.container {
+    max-width: 1400px;
+    margin: 0 auto;
+    padding: 2rem;
+}
+
+.header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 2rem;
+    padding-bottom: 1rem;
+    border-bottom: 1px solid var(--border);
+}
+
+.brand {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+}
+
+.brand-icon {
+    font-size: 1.5rem;
+}
+
+.brand-text {
+    font-size: 1.25rem;
+    font-weight: 600;
+    background: linear-gradient(135deg, var(--accent), #22d3ee);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+}
+
+.generated {
+    color: var(--text-muted);
+    font-size: 0.875rem;
+}
+
+.page-title {
+    font-size: 2.5rem;
+    font-weight: 700;
+    margin-bottom: 0.5rem;
+    letter-spacing: -0.025em;
+}
+
+.page-subtitle {
+    color: var(--text-secondary);
+    font-size: 1rem;
+    margin-bottom: 2rem;
+}
+
+.page-subtitle a {
+    color: var(--accent);
+    text-decoration: none;
+}
+
+.card {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 1.5rem;
+    margin-bottom: 1.5rem;
+}
+
+.card-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 1.5rem;
+}
+
+.card-title {
+    font-size: 1.125rem;
+    font-weight: 600;
+}
+
+.stats-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 1rem;
+    margin-bottom: 2rem;
+}
+
+.stat-card {
+    background: var(--bg-tertiary);
+    border-radius: 12px;
+    padding: 1.25rem;
+    text-align: center;
+    border: 1px solid var(--border);
+}
+
+.stat-value {
+    font-size: 2rem;
+    font-weight: 700;
+    margin-bottom: 0.25rem;
+}
+
+.stat-label {
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+.text-success { color: var(--success); }
+.text-warning { color: var(--warning); }
+.text-danger { color: var(--danger); }
+.text-muted { color: var(--text-muted); }
+
+/* Tabs */
+.tabs {
+    display: flex;
+    gap: 0.25rem;
+    background: var(--bg-tertiary);
+    padding: 4px;
+    border-radius: 10px;
+    margin-bottom: 1.5rem;
+    width: fit-content;
+}
+
+.tab {
+    padding: 0.5rem 1.25rem;
+    background: none;
+    border: none;
+    color: var(--text-secondary);
+    font-size: 0.875rem;
+    font-weight: 500;
+    cursor: pointer;
+    border-radius: 6px;
+    font-family: inherit;
+    transition: all 0.2s;
+}
+
+.tab:hover {
+    color: var(--text-primary);
+}
+
+.tab.active {
+    color: var(--text-primary);
+    background: var(--bg-secondary);
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
+}
+
+/* Heatmap */
+.heatmap-wrapper {
+    background: var(--bg-tertiary);
+    border-radius: 12px;
+    padding: 1.5rem;
+}
+
+.heatmap {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    width: 100%;
+}
+
+.heatmap-header {
+    display: flex;
+    gap: 3px;
+    padding-left: 50px;
+    margin-bottom: 8px;
+}
+
+.heatmap-header-cell {
+    flex: 1;
+    text-align: center;
+    font-size: 0.8rem;
+    font-weight: 600;
+    color: var(--text-secondary);
+    padding: 8px 0;
+}
+
+.heatmap-row {
+    display: flex;
+    gap: 3px;
+    align-items: stretch;
+}
+
+.heatmap-label {
+    width: 50px;
+    min-width: 50px;
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    text-align: right;
+    padding-right: 10px;
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    font-family: 'SF Mono', 'Fira Code', monospace;
+}
+
+.heatmap-cell {
+    flex: 1;
+    min-height: 36px;
+    border-radius: 6px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 0.85rem;
+    font-weight: 600;
+    transition: all 0.2s;
+    cursor: default;
+    font-family: 'SF Mono', 'Fira Code', monospace;
+}
+
+.heatmap-cell:hover {
+    transform: scale(1.05);
+    z-index: 10;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+}
+
+.heatmap-cell-group {
+    flex: 1;
+    display: flex;
+    gap: 2px;
+    background: var(--bg-primary);
+    border-radius: 6px;
+    padding: 3px;
+    min-height: 36px;
+}
+
+.heatmap-subcell {
+    flex: 1;
+    border-radius: 4px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 0.7rem;
+    font-weight: 600;
+    transition: all 0.2s;
+    font-family: 'SF Mono', 'Fira Code', monospace;
+}
+
+.heatmap-subcell:hover {
+    transform: scale(1.1);
+    z-index: 10;
+}
+
+.heatmap-legend {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 16px;
+    margin-top: 1.5rem;
+    padding-top: 1.5rem;
+    border-top: 1px solid var(--border);
+}
+
+.legend-label {
+    font-size: 0.8rem;
+    color: var(--text-muted);
+    font-weight: 500;
+}
+
+.legend-gradient {
+    width: 250px;
+    height: 12px;
+    border-radius: 6px;
+    background: linear-gradient(90deg, #1c1c24, #4c2d8c, #7c4fd6, #a78bfa, #2dd4bf);
+}
+
+.legend-markers {
+    display: flex;
+    justify-content: space-between;
+    width: 250px;
+    margin-top: 6px;
+}
+
+.legend-marker {
+    font-size: 0.7rem;
+    color: var(--text-muted);
+    font-family: 'SF Mono', 'Fira Code', monospace;
+}
+
+/* Member List */
+.member-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    max-height: 600px;
+    overflow-y: auto;
+}
+
+.member-item {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    padding: 0.875rem 1rem;
+    background: var(--bg-tertiary);
+    border-radius: 10px;
+    transition: all 0.2s;
+    border: 1px solid transparent;
+}
+
+.member-item:hover {
+    background: var(--bg-hover);
+    border-color: var(--border);
+}
+
+.member-avatar {
+    width: 42px;
+    height: 42px;
+    border-radius: 10px;
+    background: linear-gradient(135deg, var(--accent), #22d3ee);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-weight: 600;
+    color: white;
+    font-size: 1rem;
+    flex-shrink: 0;
+}
+
+.member-info {
+    flex: 1;
+    min-width: 0;
+}
+
+.member-name {
+    font-weight: 500;
+    margin-bottom: 0.125rem;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+.member-id {
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    font-family: 'SF Mono', 'Fira Code', monospace;
+}
+
+.member-activity {
+    text-align: right;
+    flex-shrink: 0;
+}
+
+.activity-bar {
+    width: 120px;
+    height: 8px;
+    background: var(--bg-primary);
+    border-radius: 4px;
+    overflow: hidden;
+    margin-bottom: 0.25rem;
+}
+
+.activity-fill {
+    height: 100%;
+    border-radius: 4px;
+    background: linear-gradient(90deg, var(--accent), #22d3ee);
+}
+
+.activity-text {
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+    font-family: 'SF Mono', 'Fira Code', monospace;
+}
+
+.status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    display: inline-block;
+    background: var(--success);
+    box-shadow: 0 0 8px var(--success);
+}
+
+.search-input {
+    width: 100%;
+    max-width: 400px;
+    padding: 0.875rem 1rem;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    color: var(--text-primary);
+    font-size: 0.875rem;
+    margin-bottom: 1rem;
+    font-family: inherit;
+}
+
+.search-input:focus {
+    outline: none;
+    border-color: var(--accent);
+}
+
+.search-input::placeholder {
+    color: var(--text-muted);
+}
+
+.footer {
+    margin-top: 3rem;
+    padding-top: 1.5rem;
+    border-top: 1px solid var(--border);
+    text-align: center;
+    color: var(--text-muted);
+    font-size: 0.875rem;
+}
+
+.hidden {
+    display: none !important;
+}
+
+@media (max-width: 768px) {
+    .container {
+        padding: 1rem;
+    }
+    
+    .page-title {
+        font-size: 1.75rem;
+    }
+    
+    .header {
+        flex-direction: column;
+        gap: 1rem;
+        text-align: center;
+    }
+    
+    .heatmap-cell {
+        font-size: 0.7rem;
+        min-height: 30px;
+    }
+    
+    .heatmap-subcell {
+        font-size: 0.55rem;
+    }
+}
+`;
+}
+
+function getJS() {
+    return `
+const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+
+function getHeatmapColor(value, min, max) {
+    if (max === min) return '#4c2d8c';
+    
+    const ratio = Math.max(0, Math.min(1, (value - min) / (max - min)));
+    
+    const colors = [
+        { r: 28, g: 28, b: 36 },
+        { r: 45, g: 31, b: 78 },
+        { r: 59, g: 38, b: 112 },
+        { r: 76, g: 45, b: 140 },
+        { r: 91, g: 53, b: 168 },
+        { r: 109, g: 63, b: 196 },
+        { r: 124, g: 79, b: 214 },
+        { r: 139, g: 92, b: 246 },
+        { r: 167, g: 139, b: 250 },
+        { r: 34, g: 211, b: 238 },
+        { r: 45, g: 212, b: 191 },
+    ];
+    
+    const index = ratio * (colors.length - 1);
+    const lower = Math.floor(index);
+    const upper = Math.min(lower + 1, colors.length - 1);
+    const t = index - lower;
+    
+    const r = Math.round(colors[lower].r + (colors[upper].r - colors[lower].r) * t);
+    const g = Math.round(colors[lower].g + (colors[upper].g - colors[lower].g) * t);
+    const b = Math.round(colors[lower].b + (colors[upper].b - colors[lower].b) * t);
+    
+    return 'rgb(' + r + ',' + g + ',' + b + ')';
+}
+
+function getContrastColor(value, min, max) {
+    const ratio = max > min ? (value - min) / (max - min) : 0;
+    return ratio > 0.65 ? '#000' : 'rgba(255,255,255,0.9)';
+}
+
+function renderHeatmap(heatmapData, containerId) {
+    const { data, min, max, isPercentage, is15Min } = heatmapData;
+    const container = document.getElementById(containerId);
+    
+    let html = '<div class="heatmap">';
+    
+    html += '<div class="heatmap-header">';
+    for (const day of DAYS) {
+        html += '<div class="heatmap-header-cell">' + day + '</div>';
+    }
+    html += '</div>';
+    
+    for (let hour = 0; hour < 24; hour++) {
+        html += '<div class="heatmap-row">';
+        html += '<div class="heatmap-label">' + hour.toString().padStart(2, '0') + ':00</div>';
+        
+        for (let day = 0; day < 7; day++) {
+            if (is15Min) {
+                const slots = data[hour][day];
+                html += '<div class="heatmap-cell-group">';
+                for (let slot = 0; slot < 4; slot++) {
+                    const value = slots[slot];
+                    const color = getHeatmapColor(value, min, max);
+                    const textColor = getContrastColor(value, min, max);
+                    const displayVal = isPercentage ? Math.round(value) : (Number.isInteger(value) ? value : value.toFixed(1));
+                    
+                    html += '<div class="heatmap-subcell" style="background:' + color + ';color:' + textColor + '" title="' + DAYS[day] + ' ' + hour + ':' + (slot * 15) + ' - ' + (isPercentage ? value + '%' : value) + '">' + displayVal + '</div>';
+                }
+                html += '</div>';
+            } else {
+                const value = data[hour][day];
+                const color = getHeatmapColor(value, min, max);
+                const textColor = getContrastColor(value, min, max);
+                const displayVal = isPercentage ? Math.round(value) + '%' : (Number.isInteger(value) ? value : value.toFixed(1));
+                
+                html += '<div class="heatmap-cell" style="background:' + color + ';color:' + textColor + '" title="' + DAYS[day] + ' ' + hour + ':00 - ' + (isPercentage ? value + '%' : value) + '">' + displayVal + '</div>';
+            }
+        }
+        
+        html += '</div>';
+    }
+    
+    html += '</div>';
+    
+    const minLabel = isPercentage ? '0%' : min;
+    const maxLabel = isPercentage ? '100%' : max;
+    
+    html += '<div class="heatmap-legend">';
+    html += '<span class="legend-label">Less</span>';
+    html += '<div>';
+    html += '<div class="legend-gradient"></div>';
+    html += '<div class="legend-markers"><span class="legend-marker">' + minLabel + '</span><span class="legend-marker">' + maxLabel + '</span></div>';
+    html += '</div>';
+    html += '<span class="legend-label">More</span>';
+    html += '</div>';
+    
+    container.innerHTML = html;
+}
+
+function switchTab(type) {
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    document.querySelector('[data-type="' + type + '"]').classList.add('active');
+    
+    const heatmap = type === '15min' ? DATA.heatmap15Min : DATA.heatmap;
+    renderHeatmap(heatmap, 'heatmap-container');
+}
+
+function filterMembers(query) {
+    const q = query.toLowerCase();
+    document.querySelectorAll('.member-item').forEach(item => {
+        const name = item.dataset.name;
+        const id = item.dataset.id;
+        const match = name.includes(q) || id.includes(q);
+        item.classList.toggle('hidden', !match);
+    });
+}
+
+document.addEventListener('DOMContentLoaded', function() {
+    if (DATA.heatmap) {
+        renderHeatmap(DATA.heatmap, 'heatmap-container');
+    }
+});
+`;
+}
+
+function escapeHtml(text) {
+    if (!text) return '';
+    return text
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#039;');
+}
+
+// ============================================
+// GENERATORS
+// ============================================
+
+async function generateFactionHTML(factionId) {
+    const factionData = storage.loadFactionData(factionId);
+    const snapshots = storage.getSnapshotsNormalized(factionData);
+    
+    if (!snapshots || snapshots.length === 0) {
+        throw new Error(`No data available for faction ${factionId}`);
+    }
+    
+    const latest = snapshots[snapshots.length - 1];
+    const numWeeks = helpers.getUniqueWeeks(snapshots, Math.floor(Date.now() / 1000));
+    
+    // Get heatmap data
+    const heatmap = aggregateHeatmapData(snapshots, 'hourly');
+    const heatmap15Min = aggregateHeatmapData(snapshots, '15min');
+    
+    // Get member list
+    const oneDayAgo = Math.floor(Date.now() / 1000) - 86400;
+    const memberIds = new Set();
+    
+    for (const snapshot of snapshots) {
+        if (snapshot.timestamp >= oneDayAgo) {
+            for (const id of snapshot.active) {
+                memberIds.add(id);
+            }
+        }
+    }
+    
+    const members = [];
+    for (const memberId of memberIds) {
+        const name = storage.getMemberName(memberId) || `User ${memberId}`;
+        const stats = calculateMemberStats(snapshots, memberId);
+        
+        members.push({
+            id: memberId,
+            name,
+            ...stats,
+            isOnline: latest.active.includes(memberId)
+        });
+    }
+    
+    members.sort((a, b) => b.activityScore - a.activityScore);
+    
+    const data = {
+        heatmap,
+        heatmap15Min,
+        members
+    };
+    
+    const content = `
+        <h1 class="page-title">${escapeHtml(factionData.name || 'Faction')}</h1>
+        <p class="page-subtitle">#${factionId} • ${numWeeks} weeks of data • ${snapshots.length} data points</p>
+        
+        <div class="stats-grid">
+            <div class="stat-card">
+                <div class="stat-value">${latest.total}</div>
+                <div class="stat-label">Total Members</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value text-success">${latest.active.length}</div>
+                <div class="stat-label">Last Seen Online</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value">${snapshots.length}</div>
+                <div class="stat-label">Data Points</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value">${numWeeks}</div>
+                <div class="stat-label">Weeks Tracked</div>
+            </div>
+        </div>
+        
+        <div class="card">
+            <div class="card-header">
+                <h3 class="card-title">📊 Activity Heatmap</h3>
+                <span class="text-muted">Average unique active members</span>
+            </div>
+            <div class="tabs">
+                <button class="tab active" data-type="hourly" onclick="switchTab('hourly')">Hourly</button>
+                <button class="tab" data-type="15min" onclick="switchTab('15min')">15 Minute</button>
+            </div>
+            <div class="heatmap-wrapper">
+                <div id="heatmap-container"></div>
+            </div>
+        </div>
+        
+        <div class="card">
+            <div class="card-header">
+                <h3 class="card-title">👥 Members</h3>
+                <span class="text-muted">${members.length} tracked</span>
+            </div>
+            <input type="text" class="search-input" placeholder="Search members..." oninput="filterMembers(this.value)">
+            <div class="member-list">
+                ${members.map(m => `
+                    <div class="member-item" data-name="${m.name.toLowerCase()}" data-id="${m.id}">
+                        <div class="member-avatar">${m.name.charAt(0).toUpperCase()}</div>
+                        <div class="member-info">
+                            <div class="member-name">
+                                ${escapeHtml(m.name)}
+                                ${m.isOnline ? '<span class="status-dot"></span>' : ''}
+                            </div>
+                            <div class="member-id">#${m.id}</div>
+                        </div>
+                        <div class="member-activity">
+                            <div class="activity-bar">
+                                <div class="activity-fill" style="width: ${m.activityScore}%"></div>
+                            </div>
+                            <div class="activity-text">${m.activityScore}% active</div>
+                        </div>
+                    </div>
+                `).join('')}
+            </div>
+        </div>
+    `;
+    
+    return getBaseHTML(factionData.name || `Faction ${factionId}`, content, data);
+}
+
+async function generateMemberHTML(memberId) {
+    const factionIds = storage.findUserInAllFactions(memberId);
+    
+    if (factionIds.length === 0) {
+        throw new Error(`Member ${memberId} not found in any tracked faction`);
+    }
+    
+    const memberName = storage.getMemberName(memberId) || `User ${memberId}`;
+    
+    // Aggregate snapshots from all factions
+    const allSnapshots = [];
+    const factionNames = {};
+    
+    for (const factionId of factionIds) {
+        const factionData = storage.loadFactionData(factionId);
+        const snapshots = storage.getSnapshotsNormalized(factionData);
+        factionNames[factionId] = factionData.name || `Faction ${factionId}`;
+        
+        for (const snapshot of snapshots) {
+            allSnapshots.push({
+                ...snapshot,
+                factionId
+            });
+        }
+    }
+    
+    allSnapshots.sort((a, b) => a.timestamp - b.timestamp);
+    
+    const heatmap = aggregateMemberHeatmapData(allSnapshots, memberId, 'hourly');
+    const heatmap15Min = aggregateMemberHeatmapData(allSnapshots, memberId, '15min');
+    const stats = calculateMemberStats(allSnapshots, memberId);
+    
+    const numWeeks = helpers.getUniqueWeeks(allSnapshots, Math.floor(Date.now() / 1000));
+    
+    const data = {
+        heatmap,
+        heatmap15Min
+    };
+    
+    const factionLinks = factionIds.map(id => 
+        `<a href="https://www.torn.com/factions.php?step=profile&ID=${id}" target="_blank">${escapeHtml(factionNames[id])}</a>`
+    ).join(', ');
+    
+    const content = `
+        <h1 class="page-title">${escapeHtml(memberName)}</h1>
+        <p class="page-subtitle">
+            <a href="https://www.torn.com/profiles.php?XID=${memberId}" target="_blank">#${memberId}</a> • 
+            ${factionLinks}
+        </p>
+        
+        <div class="stats-grid">
+            <div class="stat-card">
+                <div class="stat-value" style="color: ${stats.activity7d >= 60 ? 'var(--success)' : stats.activity7d >= 30 ? 'var(--warning)' : 'var(--danger)'}">${stats.activity7d}%</div>
+                <div class="stat-label">7 Day Activity</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value" style="color: ${stats.activity30d >= 60 ? 'var(--success)' : stats.activity30d >= 30 ? 'var(--warning)' : 'var(--danger)'}">${stats.activity30d}%</div>
+                <div class="stat-label">30 Day Activity</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value">${numWeeks}</div>
+                <div class="stat-label">Weeks Tracked</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value">${allSnapshots.length}</div>
+                <div class="stat-label">Data Points</div>
+            </div>
+        </div>
+        
+        <div class="card">
+            <div class="card-header">
+                <h3 class="card-title">📊 Activity Pattern</h3>
+                <span class="text-muted">Percentage of time active</span>
+            </div>
+            <div class="tabs">
+                <button class="tab active" data-type="hourly" onclick="switchTab('hourly')">Hourly</button>
+                <button class="tab" data-type="15min" onclick="switchTab('15min')">15 Minute</button>
+            </div>
+            <div class="heatmap-wrapper">
+                <div id="heatmap-container"></div>
+            </div>
+        </div>
+    `;
+    
+    return getBaseHTML(memberName, content, data);
+}
+
+module.exports = {
+    generateFactionHTML,
+    generateMemberHTML
+};
+
+================================================================================

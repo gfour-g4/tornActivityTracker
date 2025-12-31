@@ -1,6 +1,7 @@
 const api = require('./utils/api');
 const storage = require('./utils/storage');
 const hof = require('./utils/hof');
+const db = require('./database');
 
 let collectorInterval = null;
 let hofInterval = null;
@@ -60,47 +61,81 @@ async function collectAllFactions() {
     }
     
     const startTime = Date.now();
-    const estimatedTime = api.estimateCollectionTime(config.factions.length);
+    const keyCount = config.apikeys.length;
+    const concurrency = Math.min(keyCount * 2, 10); // 2 concurrent per key, max 10
     
-    console.log(`[${new Date().toISOString()}] Starting collection...`);
+    console.log(`[${new Date().toISOString()}] Starting parallel collection...`);
     console.log(`  Factions: ${config.factions.length}`);
-    console.log(`  API Keys: ${config.apikeys.length}`);
-    console.log(`  Estimated time: ${Math.ceil(estimatedTime / 60)} minutes`);
+    console.log(`  API Keys: ${keyCount}`);
+    console.log(`  Concurrency: ${concurrency}`);
     
     const results = {
         success: 0,
         failed: 0,
+        skipped: 0,
         errors: [],
         startTime,
         endTime: null
     };
     
-    let processedCount = 0;
+    // Filter out inactive factions (collect them less frequently)
+    const factionQueue = [];
+    const skippedInactive = [];
     
     for (const factionId of config.factions) {
-        const result = await collectFactionData(factionId);
-        processedCount++;
-        
-        if (result.success) {
-            results.success++;
-            if (config.factions.length <= 20 || processedCount % 50 === 0) {
-                console.log(`  [${processedCount}/${config.factions.length}] ✓ ${result.name}: ${result.active}/${result.total} active`);
+        if (db.isInactiveFaction(factionId)) {
+            // Skip 75% of the time for inactive factions
+            if (Math.random() < 0.75) {
+                skippedInactive.push(factionId);
+                results.skipped++;
+                continue;
             }
-        } else {
-            results.failed++;
-            results.errors.push({ factionId, error: result.error });
-            console.log(`  [${processedCount}/${config.factions.length}] ✗ Faction ${factionId}: ${result.error}`);
         }
-        
-        await sleep(100);
+        factionQueue.push(factionId);
     }
+    
+    if (skippedInactive.length > 0) {
+        console.log(`  Skipping ${skippedInactive.length} inactive factions`);
+    }
+    
+    let processedCount = 0;
+    const totalToProcess = factionQueue.length;
+    
+    // Parallel processing
+    async function processNext() {
+        while (factionQueue.length > 0) {
+            const factionId = factionQueue.shift();
+            const result = await collectFactionData(factionId);
+            processedCount++;
+            
+            if (result.success) {
+                results.success++;
+                if (totalToProcess <= 20 || processedCount % 50 === 0) {
+                    console.log(`  [${processedCount}/${totalToProcess}] ✓ ${result.name}: ${result.active}/${result.total}`);
+                }
+            } else {
+                results.failed++;
+                results.errors.push({ factionId, error: result.error });
+                console.log(`  [${processedCount}/${totalToProcess}] ✗ ${factionId}: ${result.error}`);
+            }
+        }
+    }
+    
+    // Start concurrent workers
+    const workers = [];
+    for (let i = 0; i < concurrency; i++) {
+        workers.push(processNext());
+    }
+    
+    await Promise.all(workers);
     
     results.endTime = Date.now();
     const duration = (results.endTime - results.startTime) / 1000;
     
     console.log(`[${new Date().toISOString()}] Collection complete!`);
-    console.log(`  Success: ${results.success}/${config.factions.length}`);
+    console.log(`  Success: ${results.success}`);
     console.log(`  Failed: ${results.failed}`);
+    console.log(`  Skipped (inactive): ${results.skipped}`);
     console.log(`  Duration: ${Math.floor(duration / 60)}m ${Math.floor(duration % 60)}s`);
     
     lastCollectionStats = results;
@@ -132,6 +167,10 @@ function startCollector() {
     console.log(`  Using ${config.apikeys.length} API keys`);
     console.log(`  Collection interval: 15 minutes`);
     
+    // Initialize database
+    db.getDb();
+    console.log('[DB] Database initialized');
+    
     // Update HOF on startup if needed
     updateHOFIfNeeded();
     
@@ -156,6 +195,7 @@ function stopCollector() {
         hofInterval = null;
     }
     
+    db.closeDb();
     console.log('[Collector] Stopped.');
 }
 
