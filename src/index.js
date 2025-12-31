@@ -48,6 +48,21 @@ client.once('ready', async () => {
 });
 
 client.on('interactionCreate', async interaction => {
+    // Handle autocomplete
+    if (interaction.isAutocomplete()) {
+        const command = client.commands.get(interaction.commandName);
+        
+        if (!command || !command.autocomplete) return;
+        
+        try {
+            await command.autocomplete(interaction);
+        } catch (error) {
+            console.error('Autocomplete error:', error);
+        }
+        return;
+    }
+    
+    // Handle commands
     if (!interaction.isChatInputCommand()) return;
     
     const command = client.commands.get(interaction.commandName);

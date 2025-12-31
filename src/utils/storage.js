@@ -391,6 +391,156 @@ function clearCache() {
     cache.factionData.clear();
 }
 
+// ============================================
+// NAME SEARCH
+// ============================================
+
+function searchFactionByName(query) {
+    const config = loadConfig();
+    const results = [];
+    const q = query.toLowerCase().trim();
+    
+    for (const factionId of config.factions) {
+        const data = loadFactionData(factionId);
+        const name = data.name || `Faction ${factionId}`;
+        
+        if (name.toLowerCase().includes(q) || factionId.toString().includes(q)) {
+            results.push({
+                id: factionId,
+                name: name
+            });
+        }
+    }
+    
+    // Sort by relevance (exact match first, then starts with, then contains)
+    results.sort((a, b) => {
+        const aLower = a.name.toLowerCase();
+        const bLower = b.name.toLowerCase();
+        
+        const aExact = aLower === q;
+        const bExact = bLower === q;
+        if (aExact && !bExact) return -1;
+        if (bExact && !aExact) return 1;
+        
+        const aStarts = aLower.startsWith(q);
+        const bStarts = bLower.startsWith(q);
+        if (aStarts && !bStarts) return -1;
+        if (bStarts && !aStarts) return 1;
+        
+        return a.name.localeCompare(b.name);
+    });
+    
+    return results.slice(0, 25); // Discord limit
+}
+
+function searchMemberByName(query) {
+    const names = loadMemberNames();
+    const results = [];
+    const q = query.toLowerCase().trim();
+    
+    for (const [id, name] of Object.entries(names)) {
+        if (name.toLowerCase().includes(q) || id.includes(q)) {
+            results.push({
+                id: parseInt(id),
+                name: name
+            });
+        }
+    }
+    
+    // Sort by relevance
+    results.sort((a, b) => {
+        const aLower = a.name.toLowerCase();
+        const bLower = b.name.toLowerCase();
+        
+        const aExact = aLower === q;
+        const bExact = bLower === q;
+        if (aExact && !bExact) return -1;
+        if (bExact && !aExact) return 1;
+        
+        const aStarts = aLower.startsWith(q);
+        const bStarts = bLower.startsWith(q);
+        if (aStarts && !bStarts) return -1;
+        if (bStarts && !aStarts) return 1;
+        
+        return a.name.localeCompare(b.name);
+    });
+    
+    return results.slice(0, 25);
+}
+
+function resolveFaction(input) {
+    // If it's a number, use as ID
+    const asNumber = parseInt(input);
+    if (!isNaN(asNumber) && asNumber.toString() === input.trim()) {
+        const data = loadFactionData(asNumber);
+        return {
+            id: asNumber,
+            name: data.name || `Faction ${asNumber}`
+        };
+    }
+    
+    // Search by name
+    const results = searchFactionByName(input);
+    if (results.length === 0) {
+        return null;
+    }
+    
+    // Return exact match if exists, otherwise first result
+    const exact = results.find(r => r.name.toLowerCase() === input.toLowerCase());
+    return exact || results[0];
+}
+
+function resolveMember(input) {
+    // If it's a number, use as ID
+    const asNumber = parseInt(input);
+    if (!isNaN(asNumber) && asNumber.toString() === input.trim()) {
+        const name = getMemberName(asNumber);
+        return {
+            id: asNumber,
+            name: name || `User ${asNumber}`
+        };
+    }
+    
+    // Search by name
+    const results = searchMemberByName(input);
+    if (results.length === 0) {
+        return null;
+    }
+    
+    const exact = results.find(r => r.name.toLowerCase() === input.toLowerCase());
+    return exact || results[0];
+}
+
+function getAllFactionChoices() {
+    const config = loadConfig();
+    const choices = [];
+    
+    for (const factionId of config.factions) {
+        const data = loadFactionData(factionId);
+        const name = data.name || `Faction ${factionId}`;
+        choices.push({
+            name: `${name} [${factionId}]`,
+            value: factionId.toString()
+        });
+    }
+    
+    return choices.slice(0, 25);
+}
+
+function getAllMemberChoices() {
+    const names = loadMemberNames();
+    const choices = [];
+    
+    for (const [id, name] of Object.entries(names)) {
+        choices.push({
+            name: `${name} [${id}]`,
+            value: id
+        });
+    }
+    
+    return choices.slice(0, 25);
+}
+
 module.exports = {
     loadConfig,
     saveConfig,
@@ -411,5 +561,11 @@ module.exports = {
     getAllFactionData,
     getAllTrackedFactionIds,
     getFactionStats,
-    clearCache
+    clearCache,
+    searchFactionByName,
+    searchMemberByName,
+    resolveFaction,
+    resolveMember,
+    getAllFactionChoices,
+    getAllMemberChoices
 };
