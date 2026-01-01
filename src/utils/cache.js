@@ -1,4 +1,3 @@
-
 const config = require('../config');
 
 class Cache {
@@ -11,12 +10,18 @@ class Cache {
         this.cleanupTimer = setInterval(() => this.cleanup(), this.cleanupInterval);
     }
     
-    get(key) {
+    get(key, invalidateIfOlderThan = null) {
         const item = this.cache.get(key);
         
         if (!item) return null;
         
         if (Date.now() > item.expires) {
+            this.cache.delete(key);
+            return null;
+        }
+        
+        // Invalidate if data has been updated since cache was created
+        if (invalidateIfOlderThan !== null && item.createdAt < invalidateIfOlderThan) {
             this.cache.delete(key);
             return null;
         }
@@ -33,12 +38,13 @@ class Cache {
         this.cache.set(key, {
             value,
             expires: Date.now() + ttl,
+            createdAt: Date.now(),
             lastAccess: Date.now()
         });
     }
     
-    has(key) {
-        return this.get(key) !== null;
+    has(key, invalidateIfOlderThan = null) {
+        return this.get(key, invalidateIfOlderThan) !== null;
     }
     
     delete(key) {

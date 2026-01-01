@@ -496,6 +496,23 @@ function isInactiveFaction(factionId) {
     return avgActive < 2 && activity.max_active < 5;
 }
 
+function getFactionLastUpdated(factionId) {
+    const row = getDb().prepare('SELECT last_updated FROM factions WHERE id = ?').get(factionId);
+    return row ? row.last_updated * 1000 : 0; // Convert to milliseconds
+}
+
+function getUserLastUpdated(userId) {
+    // Get the most recent snapshot timestamp across all factions this user is in
+    const row = getDb().prepare(`
+        SELECT MAX(s.timestamp) as last_updated
+        FROM snapshots s
+        JOIN snapshot_members sm ON s.id = sm.snapshot_id
+        WHERE sm.member_id = ?
+    `).get(userId);
+    
+    return row?.last_updated ? row.last_updated * 1000 : 0;
+}
+
 // ============================================
 // STATS
 // ============================================
@@ -551,5 +568,9 @@ module.exports = {
     isInactiveFaction,
     
     // Stats
-    getDbStats
+    getDbStats,
+
+    // lastupdate
+    getFactionLastUpdated,
+    getUserLastUpdated,
 };
