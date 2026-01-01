@@ -1,19 +1,22 @@
 {
   "name": "torn-activity-bot",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Discord bot to track Torn faction member activity",
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
-    "dev": "node --watch src/index.js",
+    "dev": "NODE_ENV=development node --watch src/index.js",
     "migrate": "node src/utils/migrate.js",
-    "generate-test-data": "node generate-test-data.js"
+    "generate-key": "node -e \"console.log(require('./src/utils/crypto').generateKey())\"",
+    "encrypt-keys": "node src/utils/encrypt-keys.js"
   },
   "dependencies": {
     "better-sqlite3": "^9.6.0",
     "canvas": "^2.11.2",
     "discord.js": "^14.14.1",
-    "dotenv": "^16.3.1"
+    "dotenv": "^16.3.1",
+    "pino": "^8.17.2",
+    "pino-pretty": "^10.3.1"
   },
   "engines": {
     "node": ">=18.0.0"

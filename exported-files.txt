@@ -1,30 +1,33 @@
 ================================================================================
 EXPORTED FILES FOR AI CHATBOT
-Export Date: 12/31/2025, 11:28:21 PM
-Total Files: 10
+Export Date: 1/1/2026, 12:35:10 AM
+Total Files: 15
 ================================================================================
 
 File: package.json
 ----------------------------------------
 {
-    "name": "torn-activity-bot",
-    "version": "1.0.0",
-    "description": "Discord bot to track Torn faction member activity",
-    "main": "src/index.js",
-    "scripts": {
-      "start": "node src/index.js",
-      "dev": "node --watch src/index.js",
-      "generate-test-data": "node generate-test-data.js"
-    },
-    "dependencies": {
-      "canvas": "^2.11.2",
-      "discord.js": "^14.14.1",
-      "dotenv": "^16.3.1"
-    },
-    "engines": {
-      "node": ">=18.0.0"
-    }
+  "name": "torn-activity-bot",
+  "version": "2.0.0",
+  "description": "Discord bot to track Torn faction member activity",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "migrate": "node src/utils/migrate.js",
+    "generate-test-data": "node generate-test-data.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^9.6.0",
+    "canvas": "^2.11.2",
+    "discord.js": "^14.14.1",
+    "dotenv": "^16.3.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
+}
+
 
 ================================================================================
 
@@ -33,6 +36,7 @@ File: src/collector.js
 const api = require('./utils/api');
 const storage = require('./utils/storage');
 const hof = require('./utils/hof');
+const db = require('./database');
 
 let collectorInterval = null;
 let hofInterval = null;
@@ -92,12 +96,13 @@ async function collectAllFactions() {
     }
     
     const startTime = Date.now();
-    const estimatedTime = api.estimateCollectionTime(config.factions.length);
+    const keyCount = config.apikeys.length;
+    const concurrency = Math.min(keyCount * 2, 10); // 2 concurrent per key, max 10
     
-    console.log(`[${new Date().toISOString()}] Starting collection...`);
+    console.log(`[${new Date().toISOString()}] Starting parallel collection...`);
     console.log(`  Factions: ${config.factions.length}`);
-    console.log(`  API Keys: ${config.apikeys.length}`);
-    console.log(`  Estimated time: ${Math.ceil(estimatedTime / 60)} minutes`);
+    console.log(`  API Keys: ${keyCount}`);
+    console.log(`  Concurrency: ${concurrency}`);
     
     const results = {
         success: 0,
@@ -107,31 +112,44 @@ async function collectAllFactions() {
         endTime: null
     };
     
-    let processedCount = 0;
+    const factionQueue = [...config.factions];
     
-    for (const factionId of config.factions) {
-        const result = await collectFactionData(factionId);
-        processedCount++;
-        
-        if (result.success) {
-            results.success++;
-            if (config.factions.length <= 20 || processedCount % 50 === 0) {
-                console.log(`  [${processedCount}/${config.factions.length}] ✓ ${result.name}: ${result.active}/${result.total} active`);
+    let processedCount = 0;
+    const totalToProcess = factionQueue.length;
+    
+    // Parallel processing
+    async function processNext() {
+        while (factionQueue.length > 0) {
+            const factionId = factionQueue.shift();
+            const result = await collectFactionData(factionId);
+            processedCount++;
+            
+            if (result.success) {
+                results.success++;
+                if (totalToProcess <= 20 || processedCount % 50 === 0) {
+                    console.log(`  [${processedCount}/${totalToProcess}] ✓ ${result.name}: ${result.active}/${result.total}`);
+                }
+            } else {
+                results.failed++;
+                results.errors.push({ factionId, error: result.error });
+                console.log(`  [${processedCount}/${totalToProcess}] ✗ ${factionId}: ${result.error}`);
             }
-        } else {
-            results.failed++;
-            results.errors.push({ factionId, error: result.error });
-            console.log(`  [${processedCount}/${config.factions.length}] ✗ Faction ${factionId}: ${result.error}`);
         }
-        
-        await sleep(100);
     }
+    
+    // Start concurrent workers
+    const workers = [];
+    for (let i = 0; i < concurrency; i++) {
+        workers.push(processNext());
+    }
+    
+    await Promise.all(workers);
     
     results.endTime = Date.now();
     const duration = (results.endTime - results.startTime) / 1000;
     
     console.log(`[${new Date().toISOString()}] Collection complete!`);
-    console.log(`  Success: ${results.success}/${config.factions.length}`);
+    console.log(`  Success: ${results.success}`);
     console.log(`  Failed: ${results.failed}`);
     console.log(`  Duration: ${Math.floor(duration / 60)}m ${Math.floor(duration % 60)}s`);
     
@@ -164,6 +182,10 @@ function startCollector() {
     console.log(`  Using ${config.apikeys.length} API keys`);
     console.log(`  Collection interval: 15 minutes`);
     
+    // Initialize database
+    db.getDb();
+    console.log('[DB] Database initialized');
+    
     // Update HOF on startup if needed
     updateHOFIfNeeded();
     
@@ -188,6 +210,7 @@ function stopCollector() {
         hofInterval = null;
     }
     
+    db.closeDb();
     console.log('[Collector] Stopped.');
 }
 
@@ -1121,16 +1144,18 @@ const {
     getDayOfWeek, 
     getThirtyDaysAgo,
     getWeekId,
-    getUniqueWeeks,
     DAY_LABELS
 } = require('./utils/helpers');
 const storage = require('./utils/storage');
+const db = require('./database');
+const { heatmapCache, aggregateCache } = require('./utils/cache');
 
-// Color interpolation: Red -> Yellow -> Green
+// ============================================
+// COLOR FUNCTIONS
+// ============================================
+
 function getColor(value, min, max) {
-    if (max === min) {
-        return 'rgb(255, 255, 0)';
-    }
+    if (max === min) return 'rgb(255, 255, 0)';
     
     const ratio = Math.max(0, Math.min(1, (value - min) / (max - min)));
     
@@ -1157,42 +1182,18 @@ function getTextColor(value, min, max) {
 }
 
 // ============================================
-// FACTION AGGREGATION
+// FAST AGGREGATION (using pre-computed data)
 // ============================================
 
-function aggregateFactionDataHourly(factionData, dayFilter) {
+function aggregateFactionDataHourlyFast(factionId, dayFilter) {
+    const cacheKey = `faction:hourly:${factionId}:${dayFilter}`;
+    const cached = aggregateCache.get(cacheKey);
+    if (cached) return cached;
+    
     const daysToShow = parseDaysFilter(dayFilter);
-    const thirtyDaysAgo = getThirtyDaysAgo();
-    const now = Math.floor(Date.now() / 1000);
-    const snapshots = storage.getSnapshotsNormalized(factionData);
+    const aggregates = db.getHourlyAggregates(factionId, 30);
     
-    // Structure: [hour][day][weekId] = Set of member IDs
-    const hourlyData = {};
-    for (let hour = 0; hour < 24; hour++) {
-        hourlyData[hour] = {};
-        for (const day of daysToShow) {
-            hourlyData[hour][day] = {};
-        }
-    }
-    
-    for (const snapshot of snapshots) {
-        if (snapshot.timestamp < thirtyDaysAgo) continue;
-        
-        const day = getDayOfWeek(snapshot.timestamp);
-        if (!daysToShow.includes(day)) continue;
-        
-        const hour = getHourFromTimestamp(snapshot.timestamp);
-        const weekId = getWeekId(snapshot.timestamp, now);
-        
-        if (!hourlyData[hour][day][weekId]) {
-            hourlyData[hour][day][weekId] = new Set();
-        }
-        
-        for (const memberId of snapshot.active) {
-            hourlyData[hour][day][weekId].add(memberId);
-        }
-    }
-    
+    // Build result structure
     const result = {};
     let globalMin = Infinity;
     let globalMax = -Infinity;
@@ -1200,67 +1201,42 @@ function aggregateFactionDataHourly(factionData, dayFilter) {
     for (let hour = 0; hour < 24; hour++) {
         result[hour] = {};
         for (const day of daysToShow) {
-            const weekData = hourlyData[hour][day];
-            const weekIds = Object.keys(weekData);
-            
-            if (weekIds.length === 0) {
-                result[hour][day] = 0;
-            } else {
-                let total = 0;
-                for (const weekId of weekIds) {
-                    total += weekData[weekId].size;
-                }
-                result[hour][day] = Math.round(total / weekIds.length * 10) / 10;
-            }
-            
-            if (result[hour][day] < globalMin) globalMin = result[hour][day];
-            if (result[hour][day] > globalMax) globalMax = result[hour][day];
+            result[hour][day] = 0;
         }
     }
     
-    return { 
+    // Fill with aggregate data
+    for (const row of aggregates) {
+        if (!daysToShow.includes(row.day_of_week)) continue;
+        
+        const avg = row.total_snapshots > 0 
+            ? Math.round(row.total_active / row.total_snapshots * 10) / 10 
+            : 0;
+        
+        result[row.hour][row.day_of_week] = avg;
+        
+        if (avg < globalMin) globalMin = avg;
+        if (avg > globalMax) globalMax = avg;
+    }
+    
+    const output = { 
         data: result, 
         min: globalMin === Infinity ? 0 : globalMin, 
         max: globalMax === -Infinity ? 0 : globalMax, 
         days: daysToShow 
     };
+    
+    aggregateCache.set(cacheKey, output);
+    return output;
 }
 
-function aggregateFactionData15Min(factionData, dayFilter) {
+function aggregateFactionData15MinFast(factionId, dayFilter) {
+    const cacheKey = `faction:15min:${factionId}:${dayFilter}`;
+    const cached = aggregateCache.get(cacheKey);
+    if (cached) return cached;
+    
     const daysToShow = parseDaysFilter(dayFilter);
-    const thirtyDaysAgo = getThirtyDaysAgo();
-    const now = Math.floor(Date.now() / 1000);
-    const snapshots = storage.getSnapshotsNormalized(factionData);
-    
-    // Structure: [hour][day][slot][weekId] = Set of member IDs
-    const data = {};
-    for (let hour = 0; hour < 24; hour++) {
-        data[hour] = {};
-        for (const day of daysToShow) {
-            data[hour][day] = {
-                0: {}, 1: {}, 2: {}, 3: {}
-            };
-        }
-    }
-    
-    for (const snapshot of snapshots) {
-        if (snapshot.timestamp < thirtyDaysAgo) continue;
-        
-        const day = getDayOfWeek(snapshot.timestamp);
-        if (!daysToShow.includes(day)) continue;
-        
-        const hour = getHourFromTimestamp(snapshot.timestamp);
-        const slot = get15MinSlotInHour(snapshot.timestamp);
-        const weekId = getWeekId(snapshot.timestamp, now);
-        
-        if (!data[hour][day][slot][weekId]) {
-            data[hour][day][slot][weekId] = new Set();
-        }
-        
-        for (const memberId of snapshot.active) {
-            data[hour][day][slot][weekId].add(memberId);
-        }
-    }
+    const aggregates = db.get15MinAggregates(factionId, 30);
     
     const result = {};
     let globalMin = Infinity;
@@ -1269,85 +1245,73 @@ function aggregateFactionData15Min(factionData, dayFilter) {
     for (let hour = 0; hour < 24; hour++) {
         result[hour] = {};
         for (const day of daysToShow) {
-            result[hour][day] = [];
-            
-            for (let slot = 0; slot < 4; slot++) {
-                const weekData = data[hour][day][slot];
-                const weekIds = Object.keys(weekData);
-                
-                let avg = 0;
-                if (weekIds.length > 0) {
-                    let total = 0;
-                    for (const weekId of weekIds) {
-                        total += weekData[weekId].size;
-                    }
-                    avg = Math.round(total / weekIds.length * 10) / 10;
-                }
-                
-                result[hour][day].push(avg);
-                
-                if (avg < globalMin) globalMin = avg;
-                if (avg > globalMax) globalMax = avg;
-            }
+            result[hour][day] = [0, 0, 0, 0];
         }
     }
     
-    return { 
+    for (const row of aggregates) {
+        if (!daysToShow.includes(row.day_of_week)) continue;
+        
+        const avg = row.total_snapshots > 0 
+            ? Math.round(row.total_active / row.total_snapshots * 10) / 10 
+            : 0;
+        
+        result[row.hour][row.day_of_week][row.slot] = avg;
+        
+        if (avg < globalMin) globalMin = avg;
+        if (avg > globalMax) globalMax = avg;
+    }
+    
+    const output = { 
         data: result, 
         min: globalMin === Infinity ? 0 : globalMin, 
         max: globalMax === -Infinity ? 0 : globalMax, 
         days: daysToShow,
         is15Min: true
     };
+    
+    aggregateCache.set(cacheKey, output);
+    return output;
 }
 
 // ============================================
-// USER AGGREGATION (MULTI-FACTION)
+// USER AGGREGATION (needs raw snapshots)
 // ============================================
 
 function aggregateUserDataHourlyMultiFaction(userId, dayFilter) {
+    const cacheKey = `user:hourly:${userId}:${dayFilter}`;
+    const cached = aggregateCache.get(cacheKey);
+    if (cached) return cached;
+    
     const daysToShow = parseDaysFilter(dayFilter);
     const thirtyDaysAgo = getThirtyDaysAgo();
     const now = Math.floor(Date.now() / 1000);
     
-    // Find all factions user has been in
     const factionIds = storage.findUserInAllFactions(userId);
     
-    if (factionIds.length === 0) {
-        return null;
-    }
+    if (factionIds.length === 0) return null;
     
-    // Aggregate across all factions
     const hourlyData = {};
     for (let hour = 0; hour < 24; hour++) {
         hourlyData[hour] = {};
         for (const day of daysToShow) {
-            hourlyData[hour][day] = {
-                weeksWithData: new Set(),
-                weeksActive: new Set()
-            };
+            hourlyData[hour][day] = { weeksWithData: new Set(), weeksActive: new Set() };
         }
     }
     
     for (const factionId of factionIds) {
-        const factionData = storage.loadFactionData(factionId);
-        const snapshots = storage.getSnapshotsNormalized(factionData);
+        const snapshots = db.getSnapshotsNormalized(factionId, thirtyDaysAgo);
         
         for (const snapshot of snapshots) {
-            if (snapshot.timestamp < thirtyDaysAgo) continue;
-            
             const day = getDayOfWeek(snapshot.timestamp);
             if (!daysToShow.includes(day)) continue;
             
             const hour = getHourFromTimestamp(snapshot.timestamp);
-            const weekId = getWeekId(snapshot.timestamp, now);
+            const weekId = `${factionId}-${getWeekId(snapshot.timestamp, now)}`;
             
-            // Create unique week key to avoid double counting
-            const weekKey = `${factionId}-${weekId}`;
-            hourlyData[hour][day].weeksWithData.add(weekKey);
-            
+            hourlyData[hour][day].weeksWithData.add(weekId);
             if (snapshot.active.includes(userId)) {
-                hourlyData[hour][day].weeksActive.add(weekKey);
+                hourlyData[hour][day].weeksActive.add(weekId);
             }
         }
     }
@@ -1358,16 +1322,13 @@ function aggregateUserDataHourlyMultiFaction(userId, dayFilter) {
         result[hour] = {};
         for (const day of daysToShow) {
             const { weeksWithData, weeksActive } = hourlyData[hour][day];
-            
-            if (weeksWithData.size === 0) {
-                result[hour][day] = 0;
-            } else {
-                result[hour][day] = Math.round((weeksActive.size / weeksWithData.size) * 100);
-            }
+            result[hour][day] = weeksWithData.size === 0 
+                ? 0 
+                : Math.round((weeksActive.size / weeksWithData.size) * 100);
         }
     }
     
-    return { 
+    const output = { 
         data: result, 
         min: 0, 
         max: 100, 
@@ -1375,46 +1336,45 @@ function aggregateUserDataHourlyMultiFaction(userId, dayFilter) {
         isPercentage: true,
         factionIds
     };
+    
+    aggregateCache.set(cacheKey, output);
+    return output;
 }
 
 function aggregateUserData15MinMultiFaction(userId, dayFilter) {
+    const cacheKey = `user:15min:${userId}:${dayFilter}`;
+    const cached = aggregateCache.get(cacheKey);
+    if (cached) return cached;
+    
     const daysToShow = parseDaysFilter(dayFilter);
     const thirtyDaysAgo = getThirtyDaysAgo();
     
     const factionIds = storage.findUserInAllFactions(userId);
     
-    if (factionIds.length === 0) {
-        return null;
-    }
+    if (factionIds.length === 0) return null;
     
-    // Structure: [hour][day][slot] = { total: 0, active: 0 }
     const data = {};
     for (let hour = 0; hour < 24; hour++) {
         data[hour] = {};
         for (const day of daysToShow) {
-            data[hour][day] = {
-                0: { total: 0, active: 0 },
-                1: { total: 0, active: 0 },
-                2: { total: 0, active: 0 },
-                3: { total: 0, active: 0 }
-            };
+            data[hour][day] = [
+                { total: 0, active: 0 },
+                { total: 0, active: 0 },
+                { total: 0, active: 0 },
+                { total: 0, active: 0 }
+            ];
         }
     }
     
-    // Track processed snapshots to avoid double counting
     const processedSnapshots = new Set();
     
     for (const factionId of factionIds) {
-        const factionData = storage.loadFactionData(factionId);
-        const snapshots = storage.getSnapshotsNormalized(factionData);
+        const snapshots = db.getSnapshotsNormalized(factionId, thirtyDaysAgo);
         
         for (const snapshot of snapshots) {
-            if (snapshot.timestamp < thirtyDaysAgo) continue;
-            
-            // Unique key for this snapshot
-            const snapshotKey = `${snapshot.timestamp}`;
-            if (processedSnapshots.has(snapshotKey)) continue;
-            processedSnapshots.add(snapshotKey);
+            const key = snapshot.timestamp.toString();
+            if (processedSnapshots.has(key)) continue;
+            processedSnapshots.add(key);
             
             const day = getDayOfWeek(snapshot.timestamp);
             if (!daysToShow.includes(day)) continue;
@@ -1423,7 +1383,6 @@ function aggregateUserData15MinMultiFaction(userId, dayFilter) {
             const slot = get15MinSlotInHour(snapshot.timestamp);
             
             data[hour][day][slot].total++;
-            
             if (snapshot.active.includes(userId)) {
                 data[hour][day][slot].active++;
             }
@@ -1436,20 +1395,14 @@ function aggregateUserData15MinMultiFaction(userId, dayFilter) {
         result[hour] = {};
         for (const day of daysToShow) {
             result[hour][day] = [];
-            
             for (let slot = 0; slot < 4; slot++) {
                 const { total, active } = data[hour][day][slot];
-                
-                if (total === 0) {
-                    result[hour][day].push(0);
-                } else {
-                    result[hour][day].push(Math.round((active / total) * 100));
-                }
+                result[hour][day].push(total === 0 ? 0 : Math.round((active / total) * 100));
             }
         }
     }
     
-    return { 
+    const output = { 
         data: result, 
         min: 0, 
         max: 100, 
@@ -1458,6 +1411,9 @@ function aggregateUserData15MinMultiFaction(userId, dayFilter) {
         isPercentage: true,
         factionIds
     };
+    
+    aggregateCache.set(cacheKey, output);
+    return output;
 }
 
 // ============================================
@@ -1529,12 +1485,9 @@ function generateHeatmapImage(title, aggregatedData, subtitle = '') {
             ctx.textAlign = 'center';
             ctx.font = '12px Arial';
             
-            let displayValue;
-            if (isPercentage) {
-                displayValue = `${Math.round(value)}%`;
-            } else {
-                displayValue = Number.isInteger(value) ? value.toString() : value.toFixed(1);
-            }
+            const displayValue = isPercentage 
+                ? `${Math.round(value)}%` 
+                : (Number.isInteger(value) ? value.toString() : value.toFixed(1));
             ctx.fillText(displayValue, x + cellWidth / 2, y + cellHeight / 2 + 4);
         });
     }
@@ -1632,12 +1585,7 @@ function generateCompact15MinImage(title, aggregatedData, subtitle = '') {
                 ctx.textAlign = 'center';
                 ctx.font = '9px Arial';
                 
-                let displayVal;
-                if (isPercentage) {
-                    displayVal = Math.round(val).toString();
-                } else {
-                    displayVal = Math.round(val).toString();
-                }
+                const displayVal = isPercentage ? Math.round(val).toString() : Math.round(val).toString();
                 ctx.fillText(displayVal, subX + subWidth / 2, y + cellHeight / 2 + 3);
             }
         });
@@ -1893,31 +1841,42 @@ function generateDifferenceImage(title1, data1, title2, data2) {
 }
 
 // ============================================
-// PUBLIC API
+// PUBLIC API (with caching)
 // ============================================
 
 async function createFactionHeatmap(factionId, granularity, dayFilter) {
-    const factionData = storage.loadFactionData(factionId);
-    const snapshots = storage.getSnapshotsNormalized(factionData);
+    const cacheKey = `img:faction:${factionId}:${granularity}:${dayFilter}`;
+    const cached = heatmapCache.get(cacheKey);
+    if (cached) return cached;
     
-    if (!snapshots || snapshots.length === 0) {
+    const faction = db.getFaction(factionId);
+    
+    if (!faction) {
         throw new Error(`No data available for faction ${factionId}. Wait for data collection.`);
     }
     
-    const title = `${factionData.name || 'Faction'} [${factionId}]`;
-    const numWeeks = getUniqueWeeks(snapshots, Math.floor(Date.now() / 1000));
-    const subtitle = `Last 30 days (${numWeeks} week${numWeeks !== 1 ? 's' : ''} of data) - Avg unique active per hour`;
+    const title = `${faction.name || 'Faction'} [${factionId}]`;
+    const numWeeks = db.getWeekCount(factionId);
+    const subtitle = `Last 30 days (${numWeeks} week${numWeeks !== 1 ? 's' : ''} of data) - Avg active per hour`;
     
+    let buffer;
     if (granularity === '15min') {
-        const aggregated = aggregateFactionData15Min(factionData, dayFilter);
-        return generateCompact15MinImage(title, aggregated, subtitle);
+        const aggregated = aggregateFactionData15MinFast(factionId, dayFilter);
+        buffer = generateCompact15MinImage(title, aggregated, subtitle);
     } else {
-        const aggregated = aggregateFactionDataHourly(factionData, dayFilter);
-        return generateHeatmapImage(title, aggregated, subtitle);
+        const aggregated = aggregateFactionDataHourlyFast(factionId, dayFilter);
+        buffer = generateHeatmapImage(title, aggregated, subtitle);
     }
+    
+    heatmapCache.set(cacheKey, buffer);
+    return buffer;
 }
 
 async function createUserHeatmap(userId, granularity, dayFilter) {
+    const cacheKey = `img:user:${userId}:${granularity}:${dayFilter}`;
+    const cached = heatmapCache.get(cacheKey);
+    if (cached) return cached;
+    
     let aggregated;
     
     if (granularity === '15min') {
@@ -1930,59 +1889,58 @@ async function createUserHeatmap(userId, granularity, dayFilter) {
         throw new Error(`User ${userId} not found in any tracked faction.`);
     }
     
-    // Get username
-    const userName = storage.getMemberName(userId) || `User`;
+    const userName = storage.getMemberName(userId) || 'User';
     const title = `${userName} [${userId}]`;
     
-    // Calculate data span
-    const factionData = storage.loadFactionData(aggregated.factionIds[0]);
-    const snapshots = storage.getSnapshotsNormalized(factionData);
-    const numWeeks = getUniqueWeeks(snapshots, Math.floor(Date.now() / 1000));
+    const numWeeks = aggregated.factionIds.length > 0 ? db.getWeekCount(aggregated.factionIds[0]) : 0;
     
     const factionInfo = aggregated.factionIds.length > 1 
         ? `across ${aggregated.factionIds.length} factions` 
         : '';
-    const subtitle = `Last 30 days (${numWeeks} week${numWeeks !== 1 ? 's' : ''}) - % of time active ${factionInfo}`;
+    const subtitle = `Last 30 days (${numWeeks} week${numWeeks !== 1 ? 's' : ''}) - % active ${factionInfo}`;
     
+    let buffer;
     if (granularity === '15min') {
-        return generateCompact15MinImage(title, aggregated, subtitle);
+        buffer = generateCompact15MinImage(title, aggregated, subtitle);
     } else {
-        return generateHeatmapImage(title, aggregated, subtitle);
+        buffer = generateHeatmapImage(title, aggregated, subtitle);
     }
+    
+    heatmapCache.set(cacheKey, buffer);
+    return buffer;
 }
 
 async function createComparisonHeatmaps(faction1Id, faction2Id, granularity, dayFilter) {
-    const faction1Data = storage.loadFactionData(faction1Id);
-    const faction2Data = storage.loadFactionData(faction2Id);
+    const cacheKey = `img:compare:${faction1Id}:${faction2Id}:${granularity}:${dayFilter}`;
+    const cached = heatmapCache.get(cacheKey);
+    if (cached) return cached;
     
-    const snapshots1 = storage.getSnapshotsNormalized(faction1Data);
-    const snapshots2 = storage.getSnapshotsNormalized(faction2Data);
+    const faction1 = db.getFaction(faction1Id);
+    const faction2 = db.getFaction(faction2Id);
     
-    if (!snapshots1?.length) {
-        throw new Error(`No data available for faction ${faction1Id}.`);
-    }
+    if (!faction1) throw new Error(`No data available for faction ${faction1Id}.`);
+    if (!faction2) throw new Error(`No data available for faction ${faction2Id}.`);
     
-    if (!snapshots2?.length) {
-        throw new Error(`No data available for faction ${faction2Id}.`);
-    }
-    
-    const name1 = faction1Data.name || `Faction ${faction1Id}`;
-    const name2 = faction2Data.name || `Faction ${faction2Id}`;
+    const name1 = faction1.name || `Faction ${faction1Id}`;
+    const name2 = faction2.name || `Faction ${faction2Id}`;
     
     let agg1, agg2;
     
     if (granularity === '15min') {
-        agg1 = aggregateFactionData15Min(faction1Data, dayFilter);
-        agg2 = aggregateFactionData15Min(faction2Data, dayFilter);
+        agg1 = aggregateFactionData15MinFast(faction1Id, dayFilter);
+        agg2 = aggregateFactionData15MinFast(faction2Id, dayFilter);
     } else {
-        agg1 = aggregateFactionDataHourly(faction1Data, dayFilter);
-        agg2 = aggregateFactionDataHourly(faction2Data, dayFilter);
+        agg1 = aggregateFactionDataHourlyFast(faction1Id, dayFilter);
+        agg2 = aggregateFactionDataHourlyFast(faction2Id, dayFilter);
     }
     
     const sideBySide = generateComparisonImage(name1, agg1, name2, agg2);
     const difference = generateDifferenceImage(name1, agg1, name2, agg2);
     
-    return { sideBySide, difference };
+    const result = { sideBySide, difference };
+    heatmapCache.set(cacheKey, result);
+    
+    return result;
 }
 
 module.exports = {
@@ -1999,6 +1957,7 @@ require('dotenv').config();
 
 const { Client, GatewayIntentBits, Collection, REST, Routes } = require('discord.js');
 const collector = require('./collector');
+const db = require('./database');
 
 const activityCommand = require('./commands/activity');
 const exportCommand = require('./commands/export');
@@ -2035,6 +1994,9 @@ async function registerCommands() {
 
 client.once('ready', async () => {
     console.log(`Logged in as ${client.user.tag}`);
+    
+    // Initialize database
+    db.getDb();
     
     await registerCommands();
     
@@ -2082,6 +2044,15 @@ client.on('interactionCreate', async interaction => {
 process.on('SIGINT', () => {
     console.log('Shutting down...');
     collector.stopCollector();
+    db.closeDb();
+    client.destroy();
+    process.exit(0);
+});
+
+process.on('SIGTERM', () => {
+    console.log('Shutting down...');
+    collector.stopCollector();
+    db.closeDb();
     client.destroy();
     process.exit(0);
 });
@@ -2515,24 +2486,15 @@ File: src/utils/storage.js
 ----------------------------------------
 const fs = require('fs');
 const path = require('path');
+const db = require('../database');
+const { memberCache } = require('./cache');
 
 const CONFIG_PATH = path.join(__dirname, '../../config.json');
 const DATA_DIR = path.join(__dirname, '../../data');
-const USER_INDEX_PATH = path.join(DATA_DIR, 'user_index.json');
-const MEMBER_NAMES_PATH = path.join(DATA_DIR, 'member_names.json');
 
-// Cache for frequently accessed data
-// NOTE: This is RAM cache only - disk storage is unlimited
-const cache = {
-    config: null,
-    configMtime: 0,
-    userIndex: null,
-    userIndexMtime: 0,
-    memberNames: null,
-    memberNamesMtime: 0,
-    factionData: new Map(), // factionId -> { data, mtime, lastAccess }
-    maxCacheSize: 100 // Max factions to keep in RAM (not disk limit!)
-};
+// Config cache
+let configCache = null;
+let configMtime = 0;
 
 function ensureDataDir() {
     if (!fs.existsSync(DATA_DIR)) {
@@ -2547,22 +2509,22 @@ function ensureDataDir() {
 function loadConfig() {
     try {
         const stats = fs.statSync(CONFIG_PATH);
-        if (cache.config && cache.configMtime === stats.mtimeMs) {
-            return cache.config;
+        if (configCache && configMtime === stats.mtimeMs) {
+            return configCache;
         }
         
         const data = fs.readFileSync(CONFIG_PATH, 'utf8');
-        cache.config = JSON.parse(data);
-        cache.configMtime = stats.mtimeMs;
-        return cache.config;
+        configCache = JSON.parse(data);
+        configMtime = stats.mtimeMs;
+        return configCache;
     } catch (error) {
         return { factions: [], apikeys: [], currentKeyIndex: 0, failedKeys: {} };
     }
 }
 
 function saveConfig(config) {
-    cache.config = config;
-    cache.configMtime = Date.now();
+    configCache = config;
+    configMtime = Date.now();
     fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2));
 }
 
@@ -2586,212 +2548,40 @@ function markKeyWorking(key) {
 }
 
 // ============================================
-// MEMBER NAMES
+// FACTION DATA (using SQLite)
 // ============================================
 
-function loadMemberNames() {
-    ensureDataDir();
+function loadFactionData(factionId) {
+    const faction = db.getFaction(factionId);
+    const snapshots = db.getSnapshotsNormalized(factionId, getThirtyDaysAgo());
     
-    try {
-        const stats = fs.statSync(MEMBER_NAMES_PATH);
-        if (cache.memberNames && cache.memberNamesMtime === stats.mtimeMs) {
-            return cache.memberNames;
-        }
-        
-        const data = fs.readFileSync(MEMBER_NAMES_PATH, 'utf8');
-        cache.memberNames = JSON.parse(data);
-        cache.memberNamesMtime = stats.mtimeMs;
-        return cache.memberNames;
-    } catch (error) {
-        return {};
-    }
-}
-
-function saveMemberNames(names) {
-    ensureDataDir();
-    cache.memberNames = names;
-    cache.memberNamesMtime = Date.now();
-    fs.writeFileSync(MEMBER_NAMES_PATH, JSON.stringify(names));
-}
-
-function updateMemberNames(members) {
-    const names = loadMemberNames();
-    let changed = false;
-    
-    for (const [id, data] of Object.entries(members)) {
-        if (data.name && names[id] !== data.name) {
-            names[id] = data.name;
-            changed = true;
-        }
-    }
-    
-    if (changed) {
-        saveMemberNames(names);
-    }
-}
-
-function getMemberName(userId) {
-    const names = loadMemberNames();
-    return names[userId] || null;
-}
-
-// ============================================
-// USER INDEX
-// ============================================
-
-function loadUserIndex() {
-    ensureDataDir();
-    
-    try {
-        const stats = fs.statSync(USER_INDEX_PATH);
-        if (cache.userIndex && cache.userIndexMtime === stats.mtimeMs) {
-            return cache.userIndex;
-        }
-        
-        const data = fs.readFileSync(USER_INDEX_PATH, 'utf8');
-        cache.userIndex = JSON.parse(data);
-        cache.userIndexMtime = stats.mtimeMs;
-        return cache.userIndex;
-    } catch (error) {
-        return {};
-    }
-}
-
-function saveUserIndex(index) {
-    ensureDataDir();
-    cache.userIndex = index;
-    cache.userIndexMtime = Date.now();
-    fs.writeFileSync(USER_INDEX_PATH, JSON.stringify(index));
-}
-
-function updateUserIndex(factionId, memberIds) {
-    const index = loadUserIndex();
-    let changed = false;
-    
-    for (const memberId of memberIds) {
-        const id = memberId.toString();
-        if (!index[id]) {
-            index[id] = [];
-        }
-        if (!index[id].includes(factionId)) {
-            index[id].push(factionId);
-            changed = true;
-        }
-    }
-    
-    if (changed) {
-        saveUserIndex(index);
-    }
-}
-
-function getUserFactions(userId) {
-    const index = loadUserIndex();
-    return index[userId.toString()] || [];
-}
-
-// ============================================
-// FACTION DATA
-// ============================================
-
-function getFactionDataPath(factionId) {
-    return path.join(DATA_DIR, `faction_${factionId}.json`);
-}
-
-function evictOldestFromCache() {
-    if (cache.factionData.size < cache.maxCacheSize) return;
-    
-    // Find least recently accessed
-    let oldestKey = null;
-    let oldestTime = Infinity;
-    
-    for (const [key, value] of cache.factionData) {
-        if (value.lastAccess < oldestTime) {
-            oldestTime = value.lastAccess;
-            oldestKey = key;
-        }
-    }
-    
-    if (oldestKey !== null) {
-        cache.factionData.delete(oldestKey);
-    }
-}
-
-function loadFactionData(factionId, useCache = true) {
-    ensureDataDir();
-    const filePath = getFactionDataPath(factionId);
-    
-    try {
-        const stats = fs.statSync(filePath);
-        
-        if (useCache) {
-            const cached = cache.factionData.get(factionId);
-            if (cached && cached.mtime === stats.mtimeMs) {
-                cached.lastAccess = Date.now();
-                return cached.data;
-            }
-        }
-        
-        const data = fs.readFileSync(filePath, 'utf8');
-        const parsed = JSON.parse(data);
-        
-        // Manage cache size (LRU eviction)
-        evictOldestFromCache();
-        
-        cache.factionData.set(factionId, { 
-            data: parsed, 
-            mtime: stats.mtimeMs,
-            lastAccess: Date.now()
-        });
-        
-        return parsed;
-    } catch (error) {
-        return {
-            factionId: factionId,
-            name: null,
-            snapshots: []
-        };
-    }
-}
-
-function saveFactionData(factionId, data) {
-    ensureDataDir();
-    const filePath = getFactionDataPath(factionId);
-    
-    // Update cache
-    cache.factionData.set(factionId, { 
-        data, 
-        mtime: Date.now(),
-        lastAccess: Date.now()
-    });
-    
-    // Write to file (compact JSON, no formatting)
-    fs.writeFileSync(filePath, JSON.stringify(data));
+    return {
+        factionId,
+        name: faction?.name || null,
+        snapshots
+    };
 }
 
 function addSnapshot(factionId, factionName, timestamp, activeMembers, totalMembers, allMemberIds) {
-    const data = loadFactionData(factionId, false);
-    data.name = factionName;
+    db.addSnapshot(factionId, factionName, timestamp, activeMembers, totalMembers);
     
-    // Use compact format
-    data.snapshots.push({
-        t: timestamp,
-        a: activeMembers,
-        n: totalMembers
-    });
-    
-    // Prune old data (older than 30 days)
-    const thirtyDaysAgo = Math.floor(Date.now() / 1000) - (30 * 24 * 60 * 60);
-    data.snapshots = data.snapshots.filter(s => (s.t || s.timestamp) >= thirtyDaysAgo);
-    
-    saveFactionData(factionId, data);
-    
-    // Update user index with all members
-    if (allMemberIds && allMemberIds.length > 0) {
-        updateUserIndex(factionId, allMemberIds);
+    // Prune old data periodically (1% chance per snapshot)
+    if (Math.random() < 0.01) {
+        const pruned = db.pruneOldData(30);
+        if (pruned > 0) {
+            console.log(`[DB] Pruned ${pruned} old snapshots`);
+        }
     }
 }
 
-// Normalize snapshot format (handle both old and new formats)
+function getSnapshotsNormalized(factionData) {
+    // If it's already normalized from DB, return as-is
+    if (Array.isArray(factionData.snapshots)) {
+        return factionData.snapshots;
+    }
+    return [];
+}
+
 function normalizeSnapshot(snapshot) {
     return {
         timestamp: snapshot.t || snapshot.timestamp,
@@ -2800,264 +2590,40 @@ function normalizeSnapshot(snapshot) {
     };
 }
 
-function getSnapshotsNormalized(factionData) {
-    return (factionData.snapshots || []).map(normalizeSnapshot);
+// ============================================
+// MEMBER NAMES
+// ============================================
+
+function updateMemberNames(members) {
+    db.upsertMembers(members);
+}
+
+function getMemberName(userId) {
+    // Check cache first
+    const cached = memberCache.get(`name:${userId}`);
+    if (cached) return cached;
+    
+    const name = db.getMemberName(userId);
+    if (name) {
+        memberCache.set(`name:${userId}`, name);
+    }
+    return name;
 }
 
 // ============================================
-// MULTI-FACTION SEARCH
+// USER INDEX
 // ============================================
 
 function findUserInAllFactions(userId) {
-    const factionIds = getUserFactions(userId);
-    
-    if (factionIds.length === 0) {
-        // Fallback: scan all faction files (slower, but needed for initial index building)
-        return scanAllFactionsForUser(userId);
-    }
-    
-    return factionIds;
+    return db.getMemberFactions(userId);
 }
 
-function scanAllFactionsForUser(userId) {
-    ensureDataDir();
-    const files = fs.readdirSync(DATA_DIR).filter(f => 
-        f.startsWith('faction_') && f.endsWith('.json')
-    );
-    
-    const foundFactions = [];
-    
-    for (const file of files) {
-        const match = file.match(/faction_(\d+)\.json/);
-        if (!match) continue;
-        
-        const factionId = parseInt(match[1]);
-        const data = loadFactionData(factionId);
-        const snapshots = getSnapshotsNormalized(data);
-        
-        for (const snapshot of snapshots) {
-            if (snapshot.active.includes(userId)) {
-                foundFactions.push(factionId);
-                break;
-            }
-        }
-    }
-    
-    // Update index for future lookups
-    if (foundFactions.length > 0) {
-        const index = loadUserIndex();
-        index[userId.toString()] = foundFactions;
-        saveUserIndex(index);
-    }
-    
-    return foundFactions;
-}
-
-function getAllTrackedFactionIds() {
-    ensureDataDir();
-    const files = fs.readdirSync(DATA_DIR).filter(f => 
-        f.startsWith('faction_') && f.endsWith('.json')
-    );
-    
-    return files.map(f => {
-        const match = f.match(/faction_(\d+)\.json/);
-        return match ? parseInt(match[1]) : null;
-    }).filter(id => id !== null);
-}
-
-function getAllFactionData() {
-    const factionIds = getAllTrackedFactionIds();
-    const factions = {};
-    
-    for (const factionId of factionIds) {
-        factions[factionId] = loadFactionData(factionId);
-    }
-    
-    return factions;
-}
-
-// Get basic stats without loading all data
-function getFactionStats() {
-    ensureDataDir();
-    const config = loadConfig();
-    const stats = {
-        configured: config.factions.length,
-        withData: 0,
-        totalSnapshots: 0
-    };
-    
-    const files = fs.readdirSync(DATA_DIR).filter(f => 
-        f.startsWith('faction_') && f.endsWith('.json')
-    );
-    
-    stats.withData = files.length;
-    
-    return stats;
+function getUserFactions(userId) {
+    return findUserInAllFactions(userId);
 }
 
 // ============================================
-// CLEANUP
-// ============================================
-
-function clearCache() {
-    cache.config = null;
-    cache.userIndex = null;
-    cache.memberNames = null;
-    cache.factionData.clear();
-}
-
-// ============================================
-// NAME SEARCH
-// ============================================
-
-function searchFactionByName(query) {
-    const config = loadConfig();
-    const results = [];
-    const q = query.toLowerCase().trim();
-    
-    for (const factionId of config.factions) {
-        const data = loadFactionData(factionId);
-        const name = data.name || `Faction ${factionId}`;
-        
-        if (name.toLowerCase().includes(q) || factionId.toString().includes(q)) {
-            results.push({
-                id: factionId,
-                name: name
-            });
-        }
-    }
-    
-    // Sort by relevance (exact match first, then starts with, then contains)
-    results.sort((a, b) => {
-        const aLower = a.name.toLowerCase();
-        const bLower = b.name.toLowerCase();
-        
-        const aExact = aLower === q;
-        const bExact = bLower === q;
-        if (aExact && !bExact) return -1;
-        if (bExact && !aExact) return 1;
-        
-        const aStarts = aLower.startsWith(q);
-        const bStarts = bLower.startsWith(q);
-        if (aStarts && !bStarts) return -1;
-        if (bStarts && !aStarts) return 1;
-        
-        return a.name.localeCompare(b.name);
-    });
-    
-    return results.slice(0, 25); // Discord limit
-}
-
-function searchMemberByName(query) {
-    const names = loadMemberNames();
-    const results = [];
-    const q = query.toLowerCase().trim();
-    
-    for (const [id, name] of Object.entries(names)) {
-        if (name.toLowerCase().includes(q) || id.includes(q)) {
-            results.push({
-                id: parseInt(id),
-                name: name
-            });
-        }
-    }
-    
-    // Sort by relevance
-    results.sort((a, b) => {
-        const aLower = a.name.toLowerCase();
-        const bLower = b.name.toLowerCase();
-        
-        const aExact = aLower === q;
-        const bExact = bLower === q;
-        if (aExact && !bExact) return -1;
-        if (bExact && !aExact) return 1;
-        
-        const aStarts = aLower.startsWith(q);
-        const bStarts = bLower.startsWith(q);
-        if (aStarts && !bStarts) return -1;
-        if (bStarts && !aStarts) return 1;
-        
-        return a.name.localeCompare(b.name);
-    });
-    
-    return results.slice(0, 25);
-}
-
-function resolveFaction(input) {
-    // If it's a number, use as ID
-    const asNumber = parseInt(input);
-    if (!isNaN(asNumber) && asNumber.toString() === input.trim()) {
-        const data = loadFactionData(asNumber);
-        return {
-            id: asNumber,
-            name: data.name || `Faction ${asNumber}`
-        };
-    }
-    
-    // Search by name
-    const results = searchFactionByName(input);
-    if (results.length === 0) {
-        return null;
-    }
-    
-    // Return exact match if exists, otherwise first result
-    const exact = results.find(r => r.name.toLowerCase() === input.toLowerCase());
-    return exact || results[0];
-}
-
-function resolveMember(input) {
-    // If it's a number, use as ID
-    const asNumber = parseInt(input);
-    if (!isNaN(asNumber) && asNumber.toString() === input.trim()) {
-        const name = getMemberName(asNumber);
-        return {
-            id: asNumber,
-            name: name || `User ${asNumber}`
-        };
-    }
-    
-    // Search by name
-    const results = searchMemberByName(input);
-    if (results.length === 0) {
-        return null;
-    }
-    
-    const exact = results.find(r => r.name.toLowerCase() === input.toLowerCase());
-    return exact || results[0];
-}
-
-function getAllFactionChoices() {
-    const config = loadConfig();
-    const choices = [];
-    
-    for (const factionId of config.factions) {
-        const data = loadFactionData(factionId);
-        const name = data.name || `Faction ${factionId}`;
-        choices.push({
-            name: `${name} [${factionId}]`,
-            value: factionId.toString()
-        });
-    }
-    
-    return choices.slice(0, 25);
-}
-
-function getAllMemberChoices() {
-    const names = loadMemberNames();
-    const choices = [];
-    
-    for (const [id, name] of Object.entries(names)) {
-        choices.push({
-            name: `${name} [${id}]`,
-            value: id
-        });
-    }
-    
-    return choices.slice(0, 25);
-}
-
-// ============================================
-// RANK-BASED FACTION MANAGEMENT
+// FACTION MANAGEMENT
 // ============================================
 
 function addFactionsByRank(rankName, minMembers = null, maxMembers = null) {
@@ -3197,40 +2763,164 @@ function removeApiKey(key) {
     return { removed: true };
 }
 
+// ============================================
+// SEARCH
+// ============================================
+
+function searchFactionByName(query) {
+    const config = loadConfig();
+    const results = [];
+    const q = query.toLowerCase().trim();
+    
+    for (const factionId of config.factions) {
+        const faction = db.getFaction(factionId);
+        const name = faction?.name || `Faction ${factionId}`;
+        
+        if (name.toLowerCase().includes(q) || factionId.toString().includes(q)) {
+            results.push({ id: factionId, name });
+        }
+    }
+    
+    results.sort((a, b) => {
+        const aLower = a.name.toLowerCase();
+        const bLower = b.name.toLowerCase();
+        
+        if (aLower === q) return -1;
+        if (bLower === q) return 1;
+        if (aLower.startsWith(q) && !bLower.startsWith(q)) return -1;
+        if (bLower.startsWith(q) && !aLower.startsWith(q)) return 1;
+        return a.name.localeCompare(b.name);
+    });
+    
+    return results.slice(0, 25);
+}
+
+function searchMemberByName(query) {
+    return db.searchMembers(query, 25).map(m => ({
+        id: m.id,
+        name: m.name
+    }));
+}
+
+function resolveFaction(input) {
+    const asNumber = parseInt(input);
+    if (!isNaN(asNumber) && asNumber.toString() === input.trim()) {
+        const faction = db.getFaction(asNumber);
+        return {
+            id: asNumber,
+            name: faction?.name || `Faction ${asNumber}`
+        };
+    }
+    
+    const results = searchFactionByName(input);
+    if (results.length === 0) return null;
+    
+    const exact = results.find(r => r.name.toLowerCase() === input.toLowerCase());
+    return exact || results[0];
+}
+
+function resolveMember(input) {
+    const asNumber = parseInt(input);
+    if (!isNaN(asNumber) && asNumber.toString() === input.trim()) {
+        const name = getMemberName(asNumber);
+        return {
+            id: asNumber,
+            name: name || `User ${asNumber}`
+        };
+    }
+    
+    const results = searchMemberByName(input);
+    if (results.length === 0) return null;
+    
+    const exact = results.find(r => r.name.toLowerCase() === input.toLowerCase());
+    return exact || results[0];
+}
+
+function getAllFactionChoices() {
+    const config = loadConfig();
+    const choices = [];
+    
+    for (const factionId of config.factions.slice(0, 25)) {
+        const faction = db.getFaction(factionId);
+        const name = faction?.name || `Faction ${factionId}`;
+        choices.push({
+            name: `${name} [${factionId}]`,
+            value: factionId.toString()
+        });
+    }
+    
+    return choices;
+}
+
+function getAllMemberChoices() {
+    const members = db.getDb().prepare(`
+        SELECT id, name FROM members 
+        ORDER BY last_seen DESC 
+        LIMIT 25
+    `).all();
+    
+    return members.map(m => ({
+        name: `${m.name} [${m.id}]`,
+        value: m.id.toString()
+    }));
+}
+
+// ============================================
+// STATS
+// ============================================
+
+function getFactionStats() {
+    const config = loadConfig();
+    const dbStats = db.getDbStats();
+    
+    return {
+        configured: config.factions.length,
+        withData: dbStats.factions,
+        totalSnapshots: dbStats.snapshots,
+        dbSize: dbStats.dbSize
+    };
+}
+
+function getAllTrackedFactionIds() {
+    return loadConfig().factions;
+}
+
+// ============================================
+// HELPERS
+// ============================================
+
+function getThirtyDaysAgo() {
+    return Math.floor(Date.now() / 1000) - (30 * 24 * 60 * 60);
+}
+
 module.exports = {
     loadConfig,
     saveConfig,
     markKeyFailed,
     markKeyWorking,
     loadFactionData,
-    saveFactionData,
     addSnapshot,
     getSnapshotsNormalized,
     normalizeSnapshot,
-    loadMemberNames,
     updateMemberNames,
     getMemberName,
-    loadUserIndex,
-    getUserFactions,
-    updateUserIndex,
     findUserInAllFactions,
-    getAllFactionData,
-    getAllTrackedFactionIds,
-    getFactionStats,
-    clearCache,
+    getUserFactions,
+    addFactionsByRank,
+    removeFactionsByRank,
+    addFactionsByIds,
+    removeFactionsByIds,
+    addApiKeys,
+    removeApiKey,
     searchFactionByName,
     searchMemberByName,
     resolveFaction,
     resolveMember,
     getAllFactionChoices,
     getAllMemberChoices,
-    // New exports
-    addFactionsByRank,
-    removeFactionsByRank,
-    addFactionsByIds,
-    removeFactionsByIds,
-    addApiKeys,
-    removeApiKey
+    getFactionStats,
+    getAllTrackedFactionIds,
+    getThirtyDaysAgo
 };
 
 ================================================================================
@@ -4355,6 +4045,1080 @@ async function generateMemberHTML(memberId) {
 module.exports = {
     generateFactionHTML,
     generateMemberHTML
+};
+
+================================================================================
+
+File: src/commands/export.js
+----------------------------------------
+const { SlashCommandBuilder, AttachmentBuilder } = require('discord.js');
+const { generateFactionHTML, generateMemberHTML } = require('../export/generator');
+const storage = require('../utils/storage');
+
+module.exports = {
+    data: new SlashCommandBuilder()
+        .setName('export')
+        .setDescription('Export activity data as HTML file')
+        .addSubcommand(subcommand =>
+            subcommand
+                .setName('faction')
+                .setDescription('Export faction activity report')
+                .addStringOption(option =>
+                    option
+                        .setName('faction')
+                        .setDescription('Faction name or ID')
+                        .setRequired(true)
+                        .setAutocomplete(true)
+                )
+        )
+        .addSubcommand(subcommand =>
+            subcommand
+                .setName('member')
+                .setDescription('Export member activity report')
+                .addStringOption(option =>
+                    option
+                        .setName('member')
+                        .setDescription('Member name or ID')
+                        .setRequired(true)
+                        .setAutocomplete(true)
+                )
+        ),
+
+    async autocomplete(interaction) {
+        const focusedOption = interaction.options.getFocused(true);
+        const value = focusedOption.value;
+        
+        let choices = [];
+        
+        if (focusedOption.name === 'member') {
+            if (value.length === 0) {
+                choices = storage.getAllMemberChoices();
+            } else {
+                choices = storage.searchMemberByName(value).map(m => ({
+                    name: `${m.name} [${m.id}]`,
+                    value: m.id.toString()
+                }));
+            }
+        } else {
+            // faction
+            if (value.length === 0) {
+                choices = storage.getAllFactionChoices();
+            } else {
+                choices = storage.searchFactionByName(value).map(f => ({
+                    name: `${f.name} [${f.id}]`,
+                    value: f.id.toString()
+                }));
+            }
+        }
+        
+        await interaction.respond(choices.slice(0, 25));
+    },
+
+    async execute(interaction) {
+        const subcommand = interaction.options.getSubcommand();
+        
+        await interaction.deferReply();
+
+        try {
+            let html, filename;
+            
+            if (subcommand === 'faction') {
+                const input = interaction.options.getString('faction');
+                const faction = storage.resolveFaction(input);
+                
+                if (!faction) {
+                    return await interaction.editReply({
+                        content: `❌ Faction not found: "${input}"\nUse a faction name or ID from the tracked list.`
+                    });
+                }
+                
+                html = await generateFactionHTML(faction.id);
+                filename = `${sanitizeFilename(faction.name)}_activity.html`;
+                
+            } else if (subcommand === 'member') {
+                const input = interaction.options.getString('member');
+                const member = storage.resolveMember(input);
+                
+                if (!member) {
+                    return await interaction.editReply({
+                        content: `❌ Member not found: "${input}"\nThe member must have been active in a tracked faction.`
+                    });
+                }
+                
+                html = await generateMemberHTML(member.id);
+                filename = `${sanitizeFilename(member.name)}_activity.html`;
+            }
+            
+            const buffer = Buffer.from(html, 'utf-8');
+            const attachment = new AttachmentBuilder(buffer, { name: filename });
+            
+            await interaction.editReply({
+                content: '📊 Here\'s your activity report! Open the HTML file in any browser.',
+                files: [attachment]
+            });
+            
+        } catch (error) {
+            console.error('Export error:', error);
+            await interaction.editReply({
+                content: `❌ Error: ${error.message}`
+            });
+        }
+    }
+};
+
+function sanitizeFilename(name) {
+    return name
+        .replace(/[^a-zA-Z0-9_\-]/g, '_')
+        .replace(/_+/g, '_')
+        .substring(0, 50);
+}
+
+================================================================================
+
+File: src/utils/cache.js
+----------------------------------------
+class Cache {
+    constructor(options = {}) {
+        this.cache = new Map();
+        this.ttl = options.ttl || 5 * 60 * 1000; // 5 minutes default
+        this.maxSize = options.maxSize || 100;
+        this.cleanupInterval = options.cleanupInterval || 60 * 1000; // 1 minute
+        
+        // Start cleanup timer
+        this.cleanupTimer = setInterval(() => this.cleanup(), this.cleanupInterval);
+    }
+    
+    get(key) {
+        const item = this.cache.get(key);
+        
+        if (!item) return null;
+        
+        if (Date.now() > item.expires) {
+            this.cache.delete(key);
+            return null;
+        }
+        
+        // Update access time for LRU
+        item.lastAccess = Date.now();
+        return item.value;
+    }
+    
+    set(key, value, ttl = this.ttl) {
+        // Evict if at max size
+        if (this.cache.size >= this.maxSize) {
+            this.evictLRU();
+        }
+        
+        this.cache.set(key, {
+            value,
+            expires: Date.now() + ttl,
+            lastAccess: Date.now()
+        });
+    }
+    
+    has(key) {
+        return this.get(key) !== null;
+    }
+    
+    delete(key) {
+        this.cache.delete(key);
+    }
+    
+    clear() {
+        this.cache.clear();
+    }
+    
+    cleanup() {
+        const now = Date.now();
+        
+        for (const [key, item] of this.cache) {
+            if (now > item.expires) {
+                this.cache.delete(key);
+            }
+        }
+    }
+    
+    evictLRU() {
+        let oldestKey = null;
+        let oldestTime = Infinity;
+        
+        for (const [key, item] of this.cache) {
+            if (item.lastAccess < oldestTime) {
+                oldestTime = item.lastAccess;
+                oldestKey = key;
+            }
+        }
+        
+        if (oldestKey) {
+            this.cache.delete(oldestKey);
+        }
+    }
+    
+    size() {
+        return this.cache.size;
+    }
+    
+    stop() {
+        if (this.cleanupTimer) {
+            clearInterval(this.cleanupTimer);
+            this.cleanupTimer = null;
+        }
+    }
+}
+
+// Pre-configured caches
+const heatmapCache = new Cache({ ttl: 5 * 60 * 1000, maxSize: 200 }); // 5 min
+const aggregateCache = new Cache({ ttl: 15 * 60 * 1000, maxSize: 500 }); // 15 min
+const memberCache = new Cache({ ttl: 60 * 60 * 1000, maxSize: 1000 }); // 1 hour
+
+module.exports = {
+    Cache,
+    heatmapCache,
+    aggregateCache,
+    memberCache
+};
+
+================================================================================
+
+File: src/utils/hof.js
+----------------------------------------
+const fs = require('fs');
+const path = require('path');
+const api = require('./api');
+
+const DATA_DIR = path.join(__dirname, '../../data');
+const HOF_CACHE_PATH = path.join(DATA_DIR, 'hof_cache.json');
+
+// Update HOF cache every 7 days
+const HOF_UPDATE_INTERVAL = 7 * 24 * 60 * 60 * 1000;
+
+// Only track these ranks
+const TRACKED_RANKS = ['diamond', 'platinum'];
+
+function ensureDataDir() {
+    if (!fs.existsSync(DATA_DIR)) {
+        fs.mkdirSync(DATA_DIR, { recursive: true });
+    }
+}
+
+function loadHOFCache() {
+    ensureDataDir();
+    
+    try {
+        const data = fs.readFileSync(HOF_CACHE_PATH, 'utf8');
+        return JSON.parse(data);
+    } catch (error) {
+        return {
+            lastUpdated: 0,
+            factions: []
+        };
+    }
+}
+
+function saveHOFCache(cache) {
+    ensureDataDir();
+    fs.writeFileSync(HOF_CACHE_PATH, JSON.stringify(cache));
+}
+
+function isHOFCacheStale() {
+    const cache = loadHOFCache();
+    const now = Date.now();
+    return (now - cache.lastUpdated) > HOF_UPDATE_INTERVAL;
+}
+
+function isTrackedRank(rank) {
+    if (!rank) return false;
+    const rankLower = rank.toLowerCase();
+    return TRACKED_RANKS.some(r => rankLower.includes(r));
+}
+
+function isBelowTrackedRanks(rank) {
+    if (!rank) return false;
+    const rankLower = rank.toLowerCase();
+    // If it's Gold or below, we've passed the ranks we care about
+    const belowRanks = ['gold', 'silver', 'bronze', 'unranked'];
+    return belowRanks.some(r => rankLower.includes(r));
+}
+
+async function updateHOFCache(progressCallback = null) {
+    console.log('[HOF] Updating faction Hall of Fame cache (Diamond & Platinum only)...');
+    
+    const allFactions = [];
+    let offset = 0;
+    const limit = 100;
+    let hasMore = true;
+    let page = 0;
+    let consecutiveNonTracked = 0;
+    
+    while (hasMore) {
+        page++;
+        if (progressCallback) {
+            progressCallback(page, allFactions.length);
+        }
+        
+        const data = await api.fetchHOFPage(offset, limit);
+        
+        if (!data.factionhof || data.factionhof.length === 0) {
+            hasMore = false;
+            break;
+        }
+        
+        let foundTrackedThisPage = false;
+        
+        for (const faction of data.factionhof) {
+            if (isTrackedRank(faction.rank)) {
+                allFactions.push(faction);
+                foundTrackedThisPage = true;
+                consecutiveNonTracked = 0;
+            } else if (isBelowTrackedRanks(faction.rank)) {
+                consecutiveNonTracked++;
+            }
+        }
+        
+        // Stop if we've seen 50+ non-tracked factions in a row (we've passed Diamond/Platinum)
+        if (consecutiveNonTracked >= 50) {
+            console.log(`[HOF] Reached Gold rank, stopping (found ${allFactions.length} Diamond/Platinum factions)`);
+            hasMore = false;
+            break;
+        }
+        
+        // Stop if no next page
+        if (!data._metadata?.links?.next) {
+            hasMore = false;
+            break;
+        }
+        
+        offset += limit;
+        
+        // Safety limit
+        if (offset >= 2000) {
+            hasMore = false;
+            break;
+        }
+        
+        // Small delay between pages
+        await new Promise(r => setTimeout(r, 500));
+    }
+    
+    const cache = {
+        lastUpdated: Date.now(),
+        factions: allFactions.map(f => ({
+            id: f.id,
+            name: f.name,
+            members: f.members,
+            position: f.position,
+            rank: f.rank
+        }))
+    };
+    
+    saveHOFCache(cache);
+    
+    console.log(`[HOF] Cached ${allFactions.length} factions (Diamond & Platinum)`);
+    
+    return cache;
+}
+
+async function ensureHOFCache() {
+    if (isHOFCacheStale()) {
+        return await updateHOFCache();
+    }
+    return loadHOFCache();
+}
+
+function getFactionsbyRank(rankName, minMembers = null, maxMembers = null) {
+    const cache = loadHOFCache();
+    const rankLower = rankName.toLowerCase();
+    
+    if (!TRACKED_RANKS.includes(rankLower)) {
+        console.warn(`[HOF] Rank "${rankName}" is not tracked. Only ${TRACKED_RANKS.join(', ')} are available.`);
+        return [];
+    }
+    
+    let filtered = cache.factions.filter(f => {
+        const factionRank = (f.rank || '').toLowerCase();
+        return factionRank.includes(rankLower);
+    });
+    
+    if (minMembers !== null && minMembers > 0) {
+        filtered = filtered.filter(f => f.members >= minMembers);
+    }
+    
+    if (maxMembers !== null && maxMembers > 0) {
+        filtered = filtered.filter(f => f.members <= maxMembers);
+    }
+    
+    return filtered;
+}
+
+function getFactionFromHOF(factionId) {
+    const cache = loadHOFCache();
+    return cache.factions.find(f => f.id === factionId) || null;
+}
+
+function searchHOFByName(query) {
+    const cache = loadHOFCache();
+    const q = query.toLowerCase().trim();
+    
+    const results = cache.factions.filter(f => 
+        f.name.toLowerCase().includes(q) || 
+        f.id.toString().includes(q)
+    );
+    
+    results.sort((a, b) => {
+        const aLower = a.name.toLowerCase();
+        const bLower = b.name.toLowerCase();
+        
+        const aExact = aLower === q;
+        const bExact = bLower === q;
+        if (aExact && !bExact) return -1;
+        if (bExact && !aExact) return 1;
+        
+        const aStarts = aLower.startsWith(q);
+        const bStarts = bLower.startsWith(q);
+        if (aStarts && !bStarts) return -1;
+        if (bStarts && !aStarts) return 1;
+        
+        return a.position - b.position;
+    });
+    
+    return results.slice(0, 25);
+}
+
+function getHOFStats() {
+    const cache = loadHOFCache();
+    
+    const rankCounts = {};
+    for (const faction of cache.factions) {
+        const baseRank = (faction.rank || 'Unknown').split(' ')[0];
+        rankCounts[baseRank] = (rankCounts[baseRank] || 0) + 1;
+    }
+    
+    return {
+        total: cache.factions.length,
+        lastUpdated: cache.lastUpdated,
+        byRank: rankCounts
+    };
+}
+
+function getTrackedRanks() {
+    return TRACKED_RANKS;
+}
+
+module.exports = {
+    loadHOFCache,
+    saveHOFCache,
+    isHOFCacheStale,
+    updateHOFCache,
+    ensureHOFCache,
+    getFactionsbyRank,
+    getFactionFromHOF,
+    searchHOFByName,
+    getHOFStats,
+    getTrackedRanks,
+    TRACKED_RANKS
+};
+
+================================================================================
+
+File: src/utils/migrate.js
+----------------------------------------
+/**
+ * Migration script: JSON files -> SQLite
+ * Run with: npm run migrate
+ */
+
+const fs = require('fs');
+const path = require('path');
+const db = require('../database');
+
+const DATA_DIR = path.join(__dirname, '../../data');
+
+async function migrate() {
+    console.log('Starting migration from JSON to SQLite...\n');
+    
+    // Initialize database
+    db.getDb();
+    console.log('✓ Database initialized\n');
+    
+    // Find all faction JSON files
+    const files = fs.readdirSync(DATA_DIR).filter(f => 
+        f.startsWith('faction_') && f.endsWith('.json')
+    );
+    
+    console.log(`Found ${files.length} faction files to migrate\n`);
+    
+    let totalSnapshots = 0;
+    let totalMembers = new Set();
+    
+    for (const file of files) {
+        const match = file.match(/faction_(\d+)\.json/);
+        if (!match) continue;
+        
+        const factionId = parseInt(match[1]);
+        const filePath = path.join(DATA_DIR, file);
+        
+        try {
+            const data = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+            
+            console.log(`Migrating: ${data.name || file}`);
+            console.log(`  Snapshots: ${data.snapshots?.length || 0}`);
+            
+            // Insert faction
+            db.upsertFaction(factionId, data.name);
+            
+            // Insert snapshots
+            const snapshots = data.snapshots || [];
+            let migrated = 0;
+            
+            for (const snapshot of snapshots) {
+                const timestamp = snapshot.t || snapshot.timestamp;
+                const active = snapshot.a || snapshot.active || [];
+                const total = snapshot.n || snapshot.total || 0;
+                
+                db.addSnapshot(factionId, data.name, timestamp, active, total);
+                
+                active.forEach(id => totalMembers.add(id));
+                migrated++;
+            }
+            
+            totalSnapshots += migrated;
+            console.log(`  ✓ Migrated ${migrated} snapshots\n`);
+            
+        } catch (error) {
+            console.error(`  ✗ Error: ${error.message}\n`);
+        }
+    }
+    
+    // Migrate member names
+    const namesPath = path.join(DATA_DIR, 'member_names.json');
+    if (fs.existsSync(namesPath)) {
+        console.log('Migrating member names...');
+        try {
+            const names = JSON.parse(fs.readFileSync(namesPath, 'utf8'));
+            let nameCount = 0;
+            
+            for (const [id, name] of Object.entries(names)) {
+                db.upsertMember(parseInt(id), name);
+                nameCount++;
+            }
+            
+            console.log(`  ✓ Migrated ${nameCount} member names\n`);
+        } catch (error) {
+            console.error(`  ✗ Error: ${error.message}\n`);
+        }
+    }
+    
+    // Print stats
+    const stats = db.getDbStats();
+    console.log('=== Migration Complete ===\n');
+    console.log(`Factions: ${stats.factions}`);
+    console.log(`Snapshots: ${stats.snapshots}`);
+    console.log(`Members: ${stats.members}`);
+    console.log(`Aggregates: ${stats.aggregates}`);
+    console.log(`Database size: ${(stats.dbSize / 1024 / 1024).toFixed(2)} MB`);
+    
+    console.log('\n=== Cleanup ===\n');
+    console.log('You can now delete the old JSON files:');
+    console.log(`  rm ${DATA_DIR}/faction_*.json`);
+    console.log(`  rm ${DATA_DIR}/member_names.json`);
+    console.log(`  rm ${DATA_DIR}/user_index.json`);
+    
+    db.closeDb();
+}
+
+migrate().catch(console.error);
+
+================================================================================
+
+File: src/database.js
+----------------------------------------
+const Database = require('better-sqlite3');
+const path = require('path');
+const fs = require('fs');
+
+const DATA_DIR = path.join(__dirname, '../data');
+const DB_PATH = path.join(DATA_DIR, 'activity.db');
+
+let db = null;
+
+function ensureDataDir() {
+    if (!fs.existsSync(DATA_DIR)) {
+        fs.mkdirSync(DATA_DIR, { recursive: true });
+    }
+}
+
+function getDb() {
+    if (db) return db;
+    
+    ensureDataDir();
+    
+    db = new Database(DB_PATH);
+    db.pragma('journal_mode = WAL');
+    db.pragma('synchronous = NORMAL');
+    db.pragma('cache_size = -64000'); // 64MB cache
+    
+    initializeSchema();
+    
+    return db;
+}
+
+function initializeSchema() {
+    db.exec(`
+        -- Factions table
+        CREATE TABLE IF NOT EXISTS factions (
+            id INTEGER PRIMARY KEY,
+            name TEXT,
+            last_updated INTEGER DEFAULT 0
+        );
+        
+        -- Snapshots table (one row per collection)
+        CREATE TABLE IF NOT EXISTS snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            faction_id INTEGER NOT NULL,
+            timestamp INTEGER NOT NULL,
+            active_count INTEGER NOT NULL,
+            total_count INTEGER NOT NULL,
+            FOREIGN KEY (faction_id) REFERENCES factions(id)
+        );
+        
+        -- Active members per snapshot (normalized)
+        CREATE TABLE IF NOT EXISTS snapshot_members (
+            snapshot_id INTEGER NOT NULL,
+            member_id INTEGER NOT NULL,
+            PRIMARY KEY (snapshot_id, member_id),
+            FOREIGN KEY (snapshot_id) REFERENCES snapshots(id)
+        );
+        
+        -- Member names
+        CREATE TABLE IF NOT EXISTS members (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            last_seen INTEGER DEFAULT 0
+        );
+        
+        -- User to faction mapping (for quick lookups)
+        CREATE TABLE IF NOT EXISTS member_factions (
+            member_id INTEGER NOT NULL,
+            faction_id INTEGER NOT NULL,
+            first_seen INTEGER NOT NULL,
+            last_seen INTEGER NOT NULL,
+            PRIMARY KEY (member_id, faction_id)
+        );
+        
+        -- Pre-aggregated daily data (for faster heatmap generation)
+        CREATE TABLE IF NOT EXISTS daily_aggregates (
+            faction_id INTEGER NOT NULL,
+            date TEXT NOT NULL, -- YYYY-MM-DD
+            hour INTEGER NOT NULL, -- 0-23
+            day_of_week INTEGER NOT NULL, -- 0-6 (Sun-Sat)
+            slot INTEGER NOT NULL DEFAULT 0, -- 0-3 for 15-min slots, 0 for hourly
+            unique_active INTEGER NOT NULL,
+            snapshot_count INTEGER NOT NULL,
+            PRIMARY KEY (faction_id, date, hour, slot)
+        );
+        
+        -- Indexes for common queries
+        CREATE INDEX IF NOT EXISTS idx_snapshots_faction_time 
+            ON snapshots(faction_id, timestamp DESC);
+        
+        CREATE INDEX IF NOT EXISTS idx_snapshot_members_member 
+            ON snapshot_members(member_id);
+        
+        CREATE INDEX IF NOT EXISTS idx_member_factions_member 
+            ON member_factions(member_id);
+        
+        CREATE INDEX IF NOT EXISTS idx_daily_agg_faction 
+            ON daily_aggregates(faction_id, date DESC);
+        
+        CREATE INDEX IF NOT EXISTS idx_daily_agg_lookup 
+            ON daily_aggregates(faction_id, day_of_week, hour, slot);
+    `);
+}
+
+function closeDb() {
+    if (db) {
+        db.close();
+        db = null;
+    }
+}
+
+// ============================================
+// FACTION OPERATIONS
+// ============================================
+
+function upsertFaction(factionId, name) {
+    const stmt = getDb().prepare(`
+        INSERT INTO factions (id, name, last_updated)
+        VALUES (?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            name = excluded.name,
+            last_updated = excluded.last_updated
+    `);
+    
+    stmt.run(factionId, name, Math.floor(Date.now() / 1000));
+}
+
+function getFaction(factionId) {
+    return getDb().prepare('SELECT * FROM factions WHERE id = ?').get(factionId);
+}
+
+function getAllFactions() {
+    return getDb().prepare('SELECT * FROM factions ORDER BY name').all();
+}
+
+// ============================================
+// SNAPSHOT OPERATIONS
+// ============================================
+
+function addSnapshot(factionId, factionName, timestamp, activeMembers, totalCount) {
+    const db = getDb();
+    
+    const insertSnapshot = db.prepare(`
+        INSERT INTO snapshots (faction_id, timestamp, active_count, total_count)
+        VALUES (?, ?, ?, ?)
+    `);
+    
+    const insertMember = db.prepare(`
+        INSERT OR IGNORE INTO snapshot_members (snapshot_id, member_id)
+        VALUES (?, ?)
+    `);
+    
+    const updateMemberFaction = db.prepare(`
+        INSERT INTO member_factions (member_id, faction_id, first_seen, last_seen)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(member_id, faction_id) DO UPDATE SET
+            last_seen = excluded.last_seen
+    `);
+    
+    const transaction = db.transaction(() => {
+        // Upsert faction
+        upsertFaction(factionId, factionName);
+        
+        // Insert snapshot
+        const result = insertSnapshot.run(factionId, timestamp, activeMembers.length, totalCount);
+        const snapshotId = result.lastInsertRowid;
+        
+        // Insert active members
+        for (const memberId of activeMembers) {
+            insertMember.run(snapshotId, memberId);
+            updateMemberFaction.run(memberId, factionId, timestamp, timestamp);
+        }
+        
+        // Update daily aggregate
+        updateDailyAggregate(factionId, timestamp, activeMembers);
+        
+        return snapshotId;
+    });
+    
+    return transaction();
+}
+
+function updateDailyAggregate(factionId, timestamp, activeMembers) {
+    const date = new Date(timestamp * 1000);
+    const dateStr = date.toISOString().split('T')[0];
+    const hour = date.getUTCHours();
+    const dayOfWeek = date.getUTCDay();
+    const slot = Math.floor(date.getUTCMinutes() / 15);
+    
+    const db = getDb();
+    
+    // Get existing aggregate
+    const existing = db.prepare(`
+        SELECT unique_active, snapshot_count FROM daily_aggregates
+        WHERE faction_id = ? AND date = ? AND hour = ? AND slot = ?
+    `).get(factionId, dateStr, hour, slot);
+    
+    if (existing) {
+        // Update - we store cumulative unique count, so just increment snapshot_count
+        // For true unique, we'd need to store member sets, but this is a good approximation
+        db.prepare(`
+            UPDATE daily_aggregates
+            SET unique_active = unique_active + ?,
+                snapshot_count = snapshot_count + 1
+            WHERE faction_id = ? AND date = ? AND hour = ? AND slot = ?
+        `).run(activeMembers.length, factionId, dateStr, hour, slot);
+    } else {
+        // Insert new
+        db.prepare(`
+            INSERT INTO daily_aggregates (faction_id, date, hour, day_of_week, slot, unique_active, snapshot_count)
+            VALUES (?, ?, ?, ?, ?, ?, 1)
+        `).run(factionId, dateStr, hour, dayOfWeek, slot, activeMembers.length);
+    }
+}
+
+function getSnapshots(factionId, since = 0) {
+    return getDb().prepare(`
+        SELECT s.*, GROUP_CONCAT(sm.member_id) as active_members
+        FROM snapshots s
+        LEFT JOIN snapshot_members sm ON s.id = sm.snapshot_id
+        WHERE s.faction_id = ? AND s.timestamp >= ?
+        GROUP BY s.id
+        ORDER BY s.timestamp ASC
+    `).all(factionId, since);
+}
+
+function getSnapshotsNormalized(factionId, since = 0) {
+    const rows = getSnapshots(factionId, since);
+    
+    return rows.map(row => ({
+        timestamp: row.timestamp,
+        active: row.active_members ? row.active_members.split(',').map(Number) : [],
+        total: row.total_count
+    }));
+}
+
+function getLatestSnapshot(factionId) {
+    const row = getDb().prepare(`
+        SELECT s.*, GROUP_CONCAT(sm.member_id) as active_members
+        FROM snapshots s
+        LEFT JOIN snapshot_members sm ON s.id = sm.snapshot_id
+        WHERE s.faction_id = ?
+        GROUP BY s.id
+        ORDER BY s.timestamp DESC
+        LIMIT 1
+    `).get(factionId);
+    
+    if (!row) return null;
+    
+    return {
+        timestamp: row.timestamp,
+        active: row.active_members ? row.active_members.split(',').map(Number) : [],
+        total: row.total_count
+    };
+}
+
+function getSnapshotCount(factionId) {
+    const row = getDb().prepare('SELECT COUNT(*) as count FROM snapshots WHERE faction_id = ?').get(factionId);
+    return row ? row.count : 0;
+}
+
+function pruneOldData(daysToKeep = 30) {
+    const cutoff = Math.floor(Date.now() / 1000) - (daysToKeep * 24 * 60 * 60);
+    const db = getDb();
+    
+    const transaction = db.transaction(() => {
+        // Get snapshot IDs to delete
+        const snapshots = db.prepare('SELECT id FROM snapshots WHERE timestamp < ?').all(cutoff);
+        const snapshotIds = snapshots.map(s => s.id);
+        
+        if (snapshotIds.length === 0) return 0;
+        
+        // Delete snapshot members
+        const placeholders = snapshotIds.map(() => '?').join(',');
+        db.prepare(`DELETE FROM snapshot_members WHERE snapshot_id IN (${placeholders})`).run(...snapshotIds);
+        
+        // Delete snapshots
+        db.prepare(`DELETE FROM snapshots WHERE id IN (${placeholders})`).run(...snapshotIds);
+        
+        // Delete old aggregates
+        const cutoffDate = new Date(cutoff * 1000).toISOString().split('T')[0];
+        db.prepare('DELETE FROM daily_aggregates WHERE date < ?').run(cutoffDate);
+        
+        return snapshotIds.length;
+    });
+    
+    return transaction();
+}
+
+// ============================================
+// MEMBER OPERATIONS
+// ============================================
+
+function upsertMember(memberId, name) {
+    getDb().prepare(`
+        INSERT INTO members (id, name, last_seen)
+        VALUES (?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            name = excluded.name,
+            last_seen = excluded.last_seen
+    `).run(memberId, name, Math.floor(Date.now() / 1000));
+}
+
+function upsertMembers(members) {
+    const stmt = getDb().prepare(`
+        INSERT INTO members (id, name, last_seen)
+        VALUES (?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            name = excluded.name,
+            last_seen = excluded.last_seen
+    `);
+    
+    const now = Math.floor(Date.now() / 1000);
+    const transaction = getDb().transaction(() => {
+        for (const [id, data] of Object.entries(members)) {
+            if (data.name) {
+                stmt.run(parseInt(id), data.name, now);
+            }
+        }
+    });
+    
+    transaction();
+}
+
+function getMemberName(memberId) {
+    const row = getDb().prepare('SELECT name FROM members WHERE id = ?').get(memberId);
+    return row ? row.name : null;
+}
+
+function searchMembers(query, limit = 25) {
+    const q = `%${query}%`;
+    return getDb().prepare(`
+        SELECT id, name FROM members
+        WHERE name LIKE ? OR CAST(id AS TEXT) LIKE ?
+        ORDER BY 
+            CASE 
+                WHEN LOWER(name) = LOWER(?) THEN 0
+                WHEN LOWER(name) LIKE LOWER(?) THEN 1
+                ELSE 2
+            END,
+            name
+        LIMIT ?
+    `).all(q, q, query, query + '%', limit);
+}
+
+function getMemberFactions(memberId) {
+    return getDb().prepare(`
+        SELECT faction_id FROM member_factions
+        WHERE member_id = ?
+        ORDER BY last_seen DESC
+    `).all(memberId).map(r => r.faction_id);
+}
+
+// ============================================
+// AGGREGATION QUERIES (FAST)
+// ============================================
+
+function getHourlyAggregates(factionId, daysBack = 30) {
+    const cutoffDate = new Date(Date.now() - daysBack * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+    
+    return getDb().prepare(`
+        SELECT 
+            day_of_week,
+            hour,
+            SUM(unique_active) as total_active,
+            SUM(snapshot_count) as total_snapshots
+        FROM daily_aggregates
+        WHERE faction_id = ? AND date >= ?
+        GROUP BY day_of_week, hour
+        ORDER BY day_of_week, hour
+    `).all(factionId, cutoffDate);
+}
+
+function get15MinAggregates(factionId, daysBack = 30) {
+    const cutoffDate = new Date(Date.now() - daysBack * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+    
+    return getDb().prepare(`
+        SELECT 
+            day_of_week,
+            hour,
+            slot,
+            SUM(unique_active) as total_active,
+            SUM(snapshot_count) as total_snapshots
+        FROM daily_aggregates
+        WHERE faction_id = ? AND date >= ?
+        GROUP BY day_of_week, hour, slot
+        ORDER BY day_of_week, hour, slot
+    `).all(factionId, cutoffDate);
+}
+
+function getWeekCount(factionId, daysBack = 30) {
+    const cutoffDate = new Date(Date.now() - daysBack * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+    
+    const row = getDb().prepare(`
+        SELECT COUNT(DISTINCT strftime('%Y-%W', date)) as weeks
+        FROM daily_aggregates
+        WHERE faction_id = ? AND date >= ?
+    `).get(factionId, cutoffDate);
+    
+    return row ? row.weeks : 0;
+}
+
+// ============================================
+// ACTIVITY CHECKING (for smart collection)
+// ============================================
+
+function getRecentActivityLevel(factionId, hours = 6) {
+    const since = Math.floor(Date.now() / 1000) - (hours * 3600);
+    
+    const row = getDb().prepare(`
+        SELECT 
+            COUNT(*) as snapshots,
+            SUM(active_count) as total_active,
+            MAX(active_count) as max_active
+        FROM snapshots
+        WHERE faction_id = ? AND timestamp >= ?
+    `).get(factionId, since);
+    
+    return row || { snapshots: 0, total_active: 0, max_active: 0 };
+}
+
+function isInactiveFaction(factionId) {
+    const activity = getRecentActivityLevel(factionId, 24);
+    
+    // Inactive if less than 5% activity over 24 hours
+    if (activity.snapshots === 0) return false; // New faction, always collect
+    
+    const avgActive = activity.total_active / activity.snapshots;
+    const faction = getFaction(factionId);
+    
+    if (!faction) return false;
+    
+    // Consider inactive if average active < 2 members over 24h
+    return avgActive < 2 && activity.max_active < 5;
+}
+
+// ============================================
+// STATS
+// ============================================
+
+function getDbStats() {
+    const db = getDb();
+    
+    return {
+        factions: db.prepare('SELECT COUNT(*) as count FROM factions').get().count,
+        snapshots: db.prepare('SELECT COUNT(*) as count FROM snapshots').get().count,
+        members: db.prepare('SELECT COUNT(*) as count FROM members').get().count,
+        aggregates: db.prepare('SELECT COUNT(*) as count FROM daily_aggregates').get().count,
+        dbSize: fs.existsSync(DB_PATH) ? fs.statSync(DB_PATH).size : 0
+    };
+}
+
+module.exports = {
+    getDb,
+    closeDb,
+    initializeSchema,
+    
+    // Factions
+    upsertFaction,
+    getFaction,
+    getAllFactions,
+    
+    // Snapshots
+    addSnapshot,
+    getSnapshots,
+    getSnapshotsNormalized,
+    getLatestSnapshot,
+    getSnapshotCount,
+    pruneOldData,
+    
+    // Members
+    upsertMember,
+    upsertMembers,
+    getMemberName,
+    searchMembers,
+    getMemberFactions,
+    
+    // Aggregates
+    getHourlyAggregates,
+    get15MinAggregates,
+    getWeekCount,
+    
+    // Activity
+    getRecentActivityLevel,
+    isInactiveFaction,
+    
+    // Stats
+    getDbStats
 };
 
 ================================================================================

@@ -1,11 +1,13 @@
+
+const config = require('../config');
+
 class Cache {
     constructor(options = {}) {
         this.cache = new Map();
-        this.ttl = options.ttl || 5 * 60 * 1000; // 5 minutes default
+        this.ttl = options.ttl || 5 * 60 * 1000;
         this.maxSize = options.maxSize || 100;
-        this.cleanupInterval = options.cleanupInterval || 60 * 1000; // 1 minute
+        this.cleanupInterval = options.cleanupInterval || 60 * 1000;
         
-        // Start cleanup timer
         this.cleanupTimer = setInterval(() => this.cleanup(), this.cleanupInterval);
     }
     
@@ -19,13 +21,11 @@ class Cache {
             return null;
         }
         
-        // Update access time for LRU
         item.lastAccess = Date.now();
         return item.value;
     }
     
     set(key, value, ttl = this.ttl) {
-        // Evict if at max size
         if (this.cache.size >= this.maxSize) {
             this.evictLRU();
         }
@@ -87,10 +87,21 @@ class Cache {
     }
 }
 
-// Pre-configured caches
-const heatmapCache = new Cache({ ttl: 5 * 60 * 1000, maxSize: 200 }); // 5 min
-const aggregateCache = new Cache({ ttl: 15 * 60 * 1000, maxSize: 500 }); // 15 min
-const memberCache = new Cache({ ttl: 60 * 60 * 1000, maxSize: 1000 }); // 1 hour
+// Pre-configured caches using config
+const heatmapCache = new Cache({ 
+    ttl: config.cache.heatmapTtlMs, 
+    maxSize: config.cache.heatmapMaxSize 
+});
+
+const aggregateCache = new Cache({ 
+    ttl: config.cache.aggregateTtlMs, 
+    maxSize: config.cache.aggregateMaxSize 
+});
+
+const memberCache = new Cache({ 
+    ttl: config.cache.memberTtlMs, 
+    maxSize: config.cache.memberMaxSize 
+});
 
 module.exports = {
     Cache,

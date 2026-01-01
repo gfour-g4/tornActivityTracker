@@ -6,6 +6,7 @@
 const fs = require('fs');
 const path = require('path');
 const db = require('../database');
+const { dbLog } = require('./logger');
 
 const DATA_DIR = path.join(__dirname, '../../data');
 
@@ -14,7 +15,7 @@ async function migrate() {
     
     // Initialize database
     db.getDb();
-    console.log('✓ Database initialized\n');
+    dbLog.info('Database initialized');
     
     // Find all faction JSON files
     const files = fs.readdirSync(DATA_DIR).filter(f => 

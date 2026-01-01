@@ -11,6 +11,7 @@ const {
 const storage = require('./utils/storage');
 const db = require('./database');
 const { heatmapCache, aggregateCache } = require('./utils/cache');
+const config = require('./config');
 
 // ============================================
 // COLOR FUNCTIONS
@@ -53,9 +54,8 @@ function aggregateFactionDataHourlyFast(factionId, dayFilter) {
     if (cached) return cached;
     
     const daysToShow = parseDaysFilter(dayFilter);
-    const aggregates = db.getHourlyAggregates(factionId, 30);
+    const aggregates = db.getHourlyAggregates(factionId, config.collection.dataRetentionDays);
     
-    // Build result structure
     const result = {};
     let globalMin = Infinity;
     let globalMax = -Infinity;
@@ -67,7 +67,6 @@ function aggregateFactionDataHourlyFast(factionId, dayFilter) {
         }
     }
     
-    // Fill with aggregate data
     for (const row of aggregates) {
         if (!daysToShow.includes(row.day_of_week)) continue;
         
@@ -98,7 +97,7 @@ function aggregateFactionData15MinFast(factionId, dayFilter) {
     if (cached) return cached;
     
     const daysToShow = parseDaysFilter(dayFilter);
-    const aggregates = db.get15MinAggregates(factionId, 30);
+    const aggregates = db.get15MinAggregates(factionId, config.collection.dataRetentionDays);
     
     const result = {};
     let globalMin = Infinity;
@@ -719,7 +718,7 @@ async function createFactionHeatmap(factionId, granularity, dayFilter) {
     
     const title = `${faction.name || 'Faction'} [${factionId}]`;
     const numWeeks = db.getWeekCount(factionId);
-    const subtitle = `Last 30 days (${numWeeks} week${numWeeks !== 1 ? 's' : ''} of data) - Avg active per hour`;
+    const subtitle = `Last ${config.collection.dataRetentionDays} days (${numWeeks} week${numWeeks !== 1 ? 's' : ''} of data) - Avg active per hour`;
     
     let buffer;
     if (granularity === '15min') {
@@ -759,7 +758,7 @@ async function createUserHeatmap(userId, granularity, dayFilter) {
     const factionInfo = aggregated.factionIds.length > 1 
         ? `across ${aggregated.factionIds.length} factions` 
         : '';
-    const subtitle = `Last 30 days (${numWeeks} week${numWeeks !== 1 ? 's' : ''}) - % active ${factionInfo}`;
+    const subtitle = `Last ${config.collection.dataRetentionDays} days (${numWeeks} week${numWeeks !== 1 ? 's' : ''}) - % active ${factionInfo}`;
     
     let buffer;
     if (granularity === '15min') {

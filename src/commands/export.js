@@ -1,6 +1,7 @@
 const { SlashCommandBuilder, AttachmentBuilder } = require('discord.js');
 const { generateFactionHTML, generateMemberHTML } = require('../export/generator');
 const storage = require('../utils/storage');
+const { cmdLog } = require('../utils/logger');
 
 module.exports = {
     data: new SlashCommandBuilder()
@@ -47,7 +48,6 @@ module.exports = {
                 }));
             }
         } else {
-            // faction
             if (value.length === 0) {
                 choices = storage.getAllFactionChoices();
             } else {
@@ -79,6 +79,7 @@ module.exports = {
                     });
                 }
                 
+                cmdLog.info({ factionId: faction.id, name: faction.name }, 'Exporting faction');
                 html = await generateFactionHTML(faction.id);
                 filename = `${sanitizeFilename(faction.name)}_activity.html`;
                 
@@ -92,6 +93,7 @@ module.exports = {
                     });
                 }
                 
+                cmdLog.info({ memberId: member.id, name: member.name }, 'Exporting member');
                 html = await generateMemberHTML(member.id);
                 filename = `${sanitizeFilename(member.name)}_activity.html`;
             }
@@ -105,7 +107,7 @@ module.exports = {
             });
             
         } catch (error) {
-            console.error('Export error:', error);
+            cmdLog.error({ error: error.message }, 'Export error');
             await interaction.editReply({
                 content: `❌ Error: ${error.message}`
             });

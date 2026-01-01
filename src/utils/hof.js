@@ -1,15 +1,14 @@
+
 const fs = require('fs');
 const path = require('path');
 const api = require('./api');
+const config = require('../config');
+const { hofLog } = require('./logger');
 
 const DATA_DIR = path.join(__dirname, '../../data');
 const HOF_CACHE_PATH = path.join(DATA_DIR, 'hof_cache.json');
 
-// Update HOF cache every 7 days
-const HOF_UPDATE_INTERVAL = 7 * 24 * 60 * 60 * 1000;
-
-// Only track these ranks
-const TRACKED_RANKS = ['diamond', 'platinum'];
+const TRACKED_RANKS = config.hof.trackedRanks;
 
 function ensureDataDir() {
     if (!fs.existsSync(DATA_DIR)) {
@@ -39,7 +38,7 @@ function saveHOFCache(cache) {
 function isHOFCacheStale() {
     const cache = loadHOFCache();
     const now = Date.now();
-    return (now - cache.lastUpdated) > HOF_UPDATE_INTERVAL;
+    return (now - cache.lastUpdated) > config.hof.updateIntervalMs;
 }
 
 function isTrackedRank(rank) {
@@ -51,13 +50,12 @@ function isTrackedRank(rank) {
 function isBelowTrackedRanks(rank) {
     if (!rank) return false;
     const rankLower = rank.toLowerCase();
-    // If it's Gold or below, we've passed the ranks we care about
     const belowRanks = ['gold', 'silver', 'bronze', 'unranked'];
     return belowRanks.some(r => rankLower.includes(r));
 }
 
 async function updateHOFCache(progressCallback = null) {
-    console.log('[HOF] Updating faction Hall of Fame cache (Diamond & Platinum only)...');
+    hofLog.info({ trackedRanks: TRACKED_RANKS }, 'Updating faction Hall of Fame cache');
     
     const allFactions = [];
     let offset = 0;
@@ -91,14 +89,12 @@ async function updateHOFCache(progressCallback = null) {
             }
         }
         
-        // Stop if we've seen 50+ non-tracked factions in a row (we've passed Diamond/Platinum)
         if (consecutiveNonTracked >= 50) {
-            console.log(`[HOF] Reached Gold rank, stopping (found ${allFactions.length} Diamond/Platinum factions)`);
+            hofLog.info({ count: allFactions.length }, 'Reached Gold rank, stopping');
             hasMore = false;
             break;
         }
         
-        // Stop if no next page
         if (!data._metadata?.links?.next) {
             hasMore = false;
             break;
@@ -106,14 +102,12 @@ async function updateHOFCache(progressCallback = null) {
         
         offset += limit;
         
-        // Safety limit
         if (offset >= 2000) {
             hasMore = false;
             break;
         }
         
-        // Small delay between pages
-        await new Promise(r => setTimeout(r, 500));
+        await new Promise(r => setTimeout(r, config.hof.pageFetchDelayMs));
     }
     
     const cache = {
@@ -129,7 +123,7 @@ async function updateHOFCache(progressCallback = null) {
     
     saveHOFCache(cache);
     
-    console.log(`[HOF] Cached ${allFactions.length} factions (Diamond & Platinum)`);
+    hofLog.info({ count: allFactions.length }, 'HOF cache updated');
     
     return cache;
 }
@@ -146,7 +140,7 @@ function getFactionsbyRank(rankName, minMembers = null, maxMembers = null) {
     const rankLower = rankName.toLowerCase();
     
     if (!TRACKED_RANKS.includes(rankLower)) {
-        console.warn(`[HOF] Rank "${rankName}" is not tracked. Only ${TRACKED_RANKS.join(', ')} are available.`);
+        hofLog.warn({ rank: rankName, available: TRACKED_RANKS }, 'Rank not tracked');
         return [];
     }
     

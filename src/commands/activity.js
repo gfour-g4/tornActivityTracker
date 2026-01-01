@@ -1,9 +1,13 @@
+
 const { SlashCommandBuilder, AttachmentBuilder, PermissionFlagsBits } = require('discord.js');
 const heatmap = require('../heatmap');
 const storage = require('../utils/storage');
 const hof = require('../utils/hof');
 const api = require('../utils/api');
 const collector = require('../collector');
+const db = require('../database');
+const { resolveMultipleFactions } = require('../utils/helpers');
+const { cmdLog } = require('../utils/logger');
 
 const GRANULARITY_CHOICES = [
     { name: 'Hourly', value: 'hourly' },
@@ -13,6 +17,12 @@ const GRANULARITY_CHOICES = [
 const RANK_CHOICES = [
     { name: 'Platinum', value: 'platinum' },
     { name: 'Diamond', value: 'diamond' }
+];
+
+const LEADERBOARD_PERIOD_CHOICES = [
+    { name: '7 Days', value: '7' },
+    { name: '14 Days', value: '14' },
+    { name: '30 Days', value: '30' }
 ];
 
 module.exports = {
@@ -94,6 +104,25 @@ module.exports = {
                     option
                         .setName('days')
                         .setDescription('Days to include')
+                )
+        )
+        // Leaderboard subcommand
+        .addSubcommand(subcommand =>
+            subcommand
+                .setName('leaderboard')
+                .setDescription('View faction member activity leaderboard')
+                .addStringOption(option =>
+                    option
+                        .setName('faction')
+                        .setDescription('Faction name or ID')
+                        .setRequired(true)
+                        .setAutocomplete(true)
+                )
+                .addStringOption(option =>
+                    option
+                        .setName('period')
+                        .setDescription('Time period')
+                        .addChoices(...LEADERBOARD_PERIOD_CHOICES)
                 )
         )
         // Management subcommands
@@ -216,83 +245,77 @@ module.exports = {
                 .setDescription('Manually refresh the faction Hall of Fame cache')
         ),
 
-        async autocomplete(interaction) {
-            const focusedOption = interaction.options.getFocused(true);
-            const value = focusedOption.value;
-            const subcommand = interaction.options.getSubcommand();
-            
-            let choices = [];
-            
-            if (focusedOption.name === 'user') {
-                if (value.length === 0) {
-                    choices = storage.getAllMemberChoices();
-                } else {
-                    choices = storage.searchMemberByName(value).map(m => ({
-                        name: `${m.name} [${m.id}]`,
-                        value: m.id.toString()
-                    }));
-                }
-            } else if (focusedOption.name === 'factions') {
-                // For add-factions and remove-factions
-                // Get the last item being typed (after last comma)
-                const parts = value.split(',');
-                const current = parts[parts.length - 1].trim();
-                const prefix = parts.slice(0, -1).join(',');
-                
-                if (current.length === 0) {
-                    // Show HOF factions
-                    const hofFactions = hof.loadHOFCache().factions.slice(0, 25);
-                    choices = hofFactions.map(f => ({
-                        name: `${f.name} [${f.id}]`,
-                        value: prefix ? `${prefix},${f.id}` : f.id.toString()
-                    }));
-                } else {
-                    // Search HOF and tracked factions
-                    const hofResults = hof.searchHOFByName(current);
-                    const trackedResults = storage.searchFactionByName(current);
-                    
-                    // Merge results
-                    const seen = new Set();
-                    const merged = [];
-                    
-                    for (const f of [...trackedResults, ...hofResults]) {
-                        if (!seen.has(f.id)) {
-                            merged.push(f);
-                            seen.add(f.id);
-                        }
-                    }
-                    
-                    choices = merged.slice(0, 25).map(f => ({
-                        name: `${f.name} [${f.id}]`,
-                        value: prefix ? `${prefix},${f.id}` : f.id.toString()
-                    }));
-                }
-            } else if (['faction', 'faction1', 'faction2'].includes(focusedOption.name)) {
-                if (value.length === 0) {
-                    choices = storage.getAllFactionChoices();
-                } else {
-                    const tracked = storage.searchFactionByName(value);
-                    const hofResults = hof.searchHOFByName(value);
-                    
-                    const seen = new Set(tracked.map(f => f.id));
-                    const merged = [...tracked];
-                    
-                    for (const f of hofResults) {
-                        if (!seen.has(f.id)) {
-                            merged.push(f);
-                            seen.add(f.id);
-                        }
-                    }
-                    
-                    choices = merged.slice(0, 25).map(f => ({
-                        name: `${f.name} [${f.id}]`,
-                        value: f.id.toString()
-                    }));
-                }
+    async autocomplete(interaction) {
+        const focusedOption = interaction.options.getFocused(true);
+        const value = focusedOption.value;
+        
+        let choices = [];
+        
+        if (focusedOption.name === 'user') {
+            if (value.length === 0) {
+                choices = storage.getAllMemberChoices();
+            } else {
+                choices = storage.searchMemberByName(value).map(m => ({
+                    name: `${m.name} [${m.id}]`,
+                    value: m.id.toString()
+                }));
             }
+        } else if (focusedOption.name === 'factions') {
+            const parts = value.split(',');
+            const current = parts[parts.length - 1].trim();
+            const prefix = parts.slice(0, -1).join(',');
             
-            await interaction.respond(choices.slice(0, 25));
-        },
+            if (current.length === 0) {
+                const hofFactions = hof.loadHOFCache().factions.slice(0, 25);
+                choices = hofFactions.map(f => ({
+                    name: `${f.name} [${f.id}]`,
+                    value: prefix ? `${prefix},${f.id}` : f.id.toString()
+                }));
+            } else {
+                const hofResults = hof.searchHOFByName(current);
+                const trackedResults = storage.searchFactionByName(current);
+                
+                const seen = new Set();
+                const merged = [];
+                
+                for (const f of [...trackedResults, ...hofResults]) {
+                    if (!seen.has(f.id)) {
+                        merged.push(f);
+                        seen.add(f.id);
+                    }
+                }
+                
+                choices = merged.slice(0, 25).map(f => ({
+                    name: `${f.name} [${f.id}]`,
+                    value: prefix ? `${prefix},${f.id}` : f.id.toString()
+                }));
+            }
+        } else if (['faction', 'faction1', 'faction2'].includes(focusedOption.name)) {
+            if (value.length === 0) {
+                choices = storage.getAllFactionChoices();
+            } else {
+                const tracked = storage.searchFactionByName(value);
+                const hofResults = hof.searchHOFByName(value);
+                
+                const seen = new Set(tracked.map(f => f.id));
+                const merged = [...tracked];
+                
+                for (const f of hofResults) {
+                    if (!seen.has(f.id)) {
+                        merged.push(f);
+                        seen.add(f.id);
+                    }
+                }
+                
+                choices = merged.slice(0, 25).map(f => ({
+                    name: `${f.name} [${f.id}]`,
+                    value: f.id.toString()
+                }));
+            }
+        }
+        
+        await interaction.respond(choices.slice(0, 25));
+    },
 
     async execute(interaction) {
         const subcommand = interaction.options.getSubcommand();
@@ -308,6 +331,10 @@ module.exports = {
         
         if (subcommand === 'compare') {
             return await handleCompare(interaction);
+        }
+        
+        if (subcommand === 'leaderboard') {
+            return await handleLeaderboard(interaction);
         }
         
         // Management commands (admin only)
@@ -393,7 +420,7 @@ async function handleFactionHeatmap(interaction) {
         await interaction.editReply({ files: [attachment] });
         
     } catch (error) {
-        console.error('Faction heatmap error:', error);
+        cmdLog.error({ error: error.message, input }, 'Faction heatmap error');
         await interaction.editReply({ content: `❌ Error: ${error.message}` });
     }
 }
@@ -423,7 +450,7 @@ async function handleUserHeatmap(interaction) {
         await interaction.editReply({ files: [attachment] });
         
     } catch (error) {
-        console.error('User heatmap error:', error);
+        cmdLog.error({ error: error.message, input }, 'User heatmap error');
         await interaction.editReply({ content: `❌ Error: ${error.message}` });
     }
 }
@@ -466,7 +493,61 @@ async function handleCompare(interaction) {
         });
         
     } catch (error) {
-        console.error('Compare error:', error);
+        cmdLog.error({ error: error.message }, 'Compare error');
+        await interaction.editReply({ content: `❌ Error: ${error.message}` });
+    }
+}
+
+// ============================================
+// LEADERBOARD HANDLER
+// ============================================
+
+async function handleLeaderboard(interaction) {
+    const input = interaction.options.getString('faction');
+    const period = parseInt(interaction.options.getString('period') || '7');
+    
+    await interaction.deferReply();
+    
+    try {
+        const faction = storage.resolveFaction(input);
+        
+        if (!faction) {
+            return await interaction.editReply({
+                content: `❌ Faction not found: "${input}"\nUse a faction name or ID from the tracked list.`
+            });
+        }
+        
+        const leaderboard = db.getMemberLeaderboard(faction.id, period, 20);
+        
+        if (leaderboard.length === 0) {
+            return await interaction.editReply({
+                content: `❌ No activity data found for **${faction.name}** in the last ${period} days.`
+            });
+        }
+        
+        const totalSnapshots = leaderboard[0]?.total_snapshots || 0;
+        
+        let response = `**📊 ${faction.name} - Activity Leaderboard (${period} Days)**\n`;
+        response += `*${totalSnapshots} data points collected*\n\n`;
+        
+        const medals = ['🥇', '🥈', '🥉'];
+        
+        for (let i = 0; i < leaderboard.length; i++) {
+            const member = leaderboard[i];
+            const percentage = totalSnapshots > 0 
+                ? Math.round((member.times_active / totalSnapshots) * 100) 
+                : 0;
+            
+            const medal = medals[i] || `**${i + 1}.**`;
+            const name = member.name || `User ${member.member_id}`;
+            
+            response += `${medal} ${name} - ${percentage}% (${member.times_active}/${totalSnapshots})\n`;
+        }
+        
+        await interaction.editReply({ content: response });
+        
+    } catch (error) {
+        cmdLog.error({ error: error.message, input }, 'Leaderboard error');
         await interaction.editReply({ content: `❌ Error: ${error.message}` });
     }
 }
@@ -481,7 +562,7 @@ async function handleAddFactions(interaction) {
     await interaction.deferReply({ ephemeral: true });
     
     try {
-        const resolved = resolveMultipleFactions(input);
+        const resolved = resolveMultipleFactions(input, hof, storage);
         
         if (resolved.length === 0) {
             return await interaction.editReply({
@@ -500,7 +581,6 @@ async function handleAddFactions(interaction) {
         
         if (result.added > 0 && resolved.length <= 10) {
             response += '\n\n**Added:**\n' + resolved
-                .filter(f => !storage.loadConfig().factions.includes(f.id) || result.added === resolved.length)
                 .slice(0, result.added)
                 .map(f => `• ${f.name} [${f.id}]${f.members ? ` - ${f.members} members` : ''}`)
                 .join('\n');
@@ -515,10 +595,11 @@ async function handleAddFactions(interaction) {
             response += `\n⚠️ Warning: Collection may not complete in 15 min. Add more API keys.`;
         }
         
+        cmdLog.info({ added: result.added, skipped: result.skipped }, 'Factions added');
         await interaction.editReply({ content: response });
         
     } catch (error) {
-        console.error('Add factions error:', error);
+        cmdLog.error({ error: error.message }, 'Add factions error');
         await interaction.editReply({ content: `❌ Error: ${error.message}` });
     }
 }
@@ -541,7 +622,6 @@ async function handleAddRank(interaction) {
             response += ` (${result.skipped} already tracked)`;
         }
         
-        // Show filter info
         const filters = [];
         if (minMembers) filters.push(`min ${minMembers}`);
         if (maxMembers) filters.push(`max ${maxMembers}`);
@@ -564,14 +644,14 @@ async function handleAddRank(interaction) {
             response += `\n⚠️ Warning: Collection may not complete in 15 min. Add more API keys.`;
         }
         
+        cmdLog.info({ rank, added: result.added, skipped: result.skipped }, 'Rank factions added');
         await interaction.editReply({ content: response });
         
     } catch (error) {
-        console.error('Add rank error:', error);
+        cmdLog.error({ error: error.message }, 'Add rank error');
         await interaction.editReply({ content: `❌ Error: ${error.message}` });
     }
 }
-
 
 async function handleAddKeys(interaction) {
     const keysInput = interaction.options.getString('keys');
@@ -589,6 +669,8 @@ async function handleAddKeys(interaction) {
     
     const result = storage.addApiKeys(keys);
     
+    cmdLog.info({ added: result.added, skipped: result.skipped }, 'API keys added');
+    
     await interaction.reply({
         content: `✅ Added **${result.added}** API key(s)` + 
             (result.skipped > 0 ? ` (${result.skipped} already exist)` : ''),
@@ -602,7 +684,7 @@ async function handleRemoveFactions(interaction) {
     await interaction.deferReply({ ephemeral: true });
     
     try {
-        const resolved = resolveMultipleFactions(input);
+        const resolved = resolveMultipleFactions(input, hof, storage);
         
         if (resolved.length === 0) {
             return await interaction.editReply({
@@ -627,67 +709,13 @@ async function handleRemoveFactions(interaction) {
         const config = storage.loadConfig();
         response += `\n\n📈 Now tracking **${config.factions.length}** factions`;
         
+        cmdLog.info({ removed: result.removed }, 'Factions removed');
         await interaction.editReply({ content: response });
         
     } catch (error) {
-        console.error('Remove factions error:', error);
+        cmdLog.error({ error: error.message }, 'Remove factions error');
         await interaction.editReply({ content: `❌ Error: ${error.message}` });
     }
-}
-
-
-function resolveMultipleFactions(input) {
-    const parts = input.split(',').map(p => p.trim()).filter(p => p.length > 0);
-    const resolved = [];
-    const seen = new Set();
-    
-    for (const part of parts) {
-        // Try as ID first
-        const asNumber = parseInt(part);
-        if (!isNaN(asNumber) && asNumber.toString() === part) {
-            if (!seen.has(asNumber)) {
-                // Try to get name from HOF or storage
-                const hofData = hof.getFactionFromHOF(asNumber);
-                const storageData = storage.loadFactionData(asNumber);
-                
-                resolved.push({
-                    id: asNumber,
-                    name: hofData?.name || storageData?.name || `Faction ${asNumber}`,
-                    members: hofData?.members || null
-                });
-                seen.add(asNumber);
-            }
-            continue;
-        }
-        
-        // Try as name - search HOF first, then tracked
-        const hofResults = hof.searchHOFByName(part);
-        const trackedResults = storage.searchFactionByName(part);
-        
-        // Find exact match first
-        let found = hofResults.find(f => f.name.toLowerCase() === part.toLowerCase());
-        if (!found) {
-            found = trackedResults.find(f => f.name.toLowerCase() === part.toLowerCase());
-        }
-        // If no exact match, use first result
-        if (!found && hofResults.length > 0) {
-            found = hofResults[0];
-        }
-        if (!found && trackedResults.length > 0) {
-            found = trackedResults[0];
-        }
-        
-        if (found && !seen.has(found.id)) {
-            resolved.push({
-                id: found.id,
-                name: found.name,
-                members: found.members || null
-            });
-            seen.add(found.id);
-        }
-    }
-    
-    return resolved;
 }
 
 async function handleRemoveRank(interaction) {
@@ -706,7 +734,6 @@ async function handleRemoveRank(interaction) {
             ? `✅ Removed **${result.removed}** ${rank} faction(s)`
             : `⚠️ No matching ${rank} factions were being tracked.`;
         
-        // Show filter info
         const filters = [];
         if (minMembers) filters.push(`min ${minMembers}`);
         if (maxMembers) filters.push(`max ${maxMembers}`);
@@ -723,10 +750,11 @@ async function handleRemoveRank(interaction) {
         const config = storage.loadConfig();
         response += `\n\n📈 Now tracking **${config.factions.length}** factions`;
         
+        cmdLog.info({ rank, removed: result.removed }, 'Rank factions removed');
         await interaction.editReply({ content: response });
         
     } catch (error) {
-        console.error('Remove rank error:', error);
+        cmdLog.error({ error: error.message }, 'Remove rank error');
         await interaction.editReply({ content: `❌ Error: ${error.message}` });
     }
 }
@@ -735,6 +763,10 @@ async function handleRemoveKey(interaction) {
     const key = interaction.options.getString('key');
     
     const result = storage.removeApiKey(key);
+    
+    if (result.removed) {
+        cmdLog.info('API key removed');
+    }
     
     await interaction.reply({
         content: result.removed 
@@ -750,7 +782,6 @@ async function handleList(interaction) {
     
     let response = '**📊 Activity Tracker Configuration**\n\n';
     
-    // Factions
     response += `**Factions:** ${config.factions.length} tracked\n`;
     
     if (config.factions.length > 0 && config.factions.length <= 20) {
@@ -763,7 +794,6 @@ async function handleList(interaction) {
             response += `> • ${name} [${factionId}] - ${rank} - ${snapshots} snapshots\n`;
         }
     } else if (config.factions.length > 20) {
-        // Group by rank
         const byRank = {};
         for (const factionId of config.factions) {
             const hofData = hof.getFactionFromHOF(factionId);
@@ -776,10 +806,8 @@ async function handleList(interaction) {
         }
     }
     
-    // API Keys
     response += `\n**API Keys:** ${config.apikeys.length} configured\n`;
     
-    // Collection estimate
     const estimate = api.estimateCollectionTime(config.factions.length);
     response += `\n**Collection:**\n`;
     response += `> Rate limit: ${api.RATE_LIMIT_PER_KEY} calls/min/key\n`;
@@ -791,7 +819,6 @@ async function handleList(interaction) {
         response += `\n⚠️ **Warning:** Need ${neededKeys}+ keys to finish in 15 min!\n`;
     }
     
-    // HOF cache
     response += `\n**HOF Cache:**\n`;
     response += `> Total factions: ${hofStats.total}\n`;
     
@@ -852,10 +879,12 @@ async function handleCollect(interaction) {
     const config = storage.loadConfig();
     const estimate = api.estimateCollectionTime(config.factions.length);
     
+    cmdLog.info({ factions: config.factions.length }, 'Manual collection triggered');
+    
     await interaction.reply({
         content: `🔄 Starting manual collection of ${config.factions.length} factions...\n` +
             `⏱️ Estimated time: ${Math.ceil(estimate / 60)} minutes\n\n` +
-            `Check console for progress.`,
+            `Check logs for progress.`,
         ephemeral: true
     });
     
@@ -866,10 +895,9 @@ async function handleRefreshHOF(interaction) {
     await interaction.deferReply({ ephemeral: true });
     
     try {
-        let lastUpdate = '';
-        const cache = await hof.updateHOFCache((page, count) => {
-            lastUpdate = `📥 Fetching page ${page}... (${count} factions)`;
-        });
+        cmdLog.info('Manual HOF refresh triggered');
+        
+        await hof.updateHOFCache();
         
         const stats = hof.getHOFStats();
         
@@ -884,7 +912,7 @@ async function handleRefreshHOF(interaction) {
         await interaction.editReply({ content: response });
         
     } catch (error) {
-        console.error('Refresh HOF error:', error);
+        cmdLog.error({ error: error.message }, 'Refresh HOF error');
         await interaction.editReply({ content: `❌ Error: ${error.message}` });
     }
 }

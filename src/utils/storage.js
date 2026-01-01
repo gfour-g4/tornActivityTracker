@@ -2,6 +2,9 @@ const fs = require('fs');
 const path = require('path');
 const db = require('../database');
 const { memberCache } = require('./cache');
+const { encrypt, decrypt } = require('./crypto');
+const { getThirtyDaysAgo } = require('./helpers');
+const { dbLog } = require('./logger');
 
 const CONFIG_PATH = path.join(__dirname, '../../config.json');
 const DATA_DIR = path.join(__dirname, '../../data');
@@ -28,7 +31,14 @@ function loadConfig() {
         }
         
         const data = fs.readFileSync(CONFIG_PATH, 'utf8');
-        configCache = JSON.parse(data);
+        const config = JSON.parse(data);
+        
+        // Decrypt API keys on load
+        if (config.apikeys) {
+            config.apikeys = config.apikeys.map(key => decrypt(key));
+        }
+        
+        configCache = config;
         configMtime = stats.mtimeMs;
         return configCache;
     } catch (error) {
@@ -37,9 +47,15 @@ function loadConfig() {
 }
 
 function saveConfig(config) {
-    configCache = config;
+    // Create a copy with encrypted API keys for saving
+    const configToSave = {
+        ...config,
+        apikeys: config.apikeys.map(key => encrypt(key))
+    };
+    
+    configCache = config; // Keep decrypted version in cache
     configMtime = Date.now();
-    fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2));
+    fs.writeFileSync(CONFIG_PATH, JSON.stringify(configToSave, null, 2));
 }
 
 // ============================================
@@ -81,15 +97,14 @@ function addSnapshot(factionId, factionName, timestamp, activeMembers, totalMemb
     
     // Prune old data periodically (1% chance per snapshot)
     if (Math.random() < 0.01) {
-        const pruned = db.pruneOldData(30);
+        const pruned = db.pruneOldData();
         if (pruned > 0) {
-            console.log(`[DB] Pruned ${pruned} old snapshots`);
+            dbLog.info({ pruned }, 'Pruned old snapshots');
         }
     }
 }
 
 function getSnapshotsNormalized(factionData) {
-    // If it's already normalized from DB, return as-is
     if (Array.isArray(factionData.snapshots)) {
         return factionData.snapshots;
     }
@@ -113,7 +128,6 @@ function updateMemberNames(members) {
 }
 
 function getMemberName(userId) {
-    // Check cache first
     const cached = memberCache.get(`name:${userId}`);
     if (cached) return cached;
     
@@ -397,14 +411,6 @@ function getFactionStats() {
 
 function getAllTrackedFactionIds() {
     return loadConfig().factions;
-}
-
-// ============================================
-// HELPERS
-// ============================================
-
-function getThirtyDaysAgo() {
-    return Math.floor(Date.now() / 1000) - (30 * 24 * 60 * 60);
 }
 
 module.exports = {

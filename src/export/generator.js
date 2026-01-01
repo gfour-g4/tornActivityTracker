@@ -1,7 +1,17 @@
 const storage = require('../utils/storage');
-const helpers = require('../utils/helpers');
+const { 
+    getThirtyDaysAgo, 
+    getDaysAgo,
+    getDayOfWeek, 
+    getHourFromTimestamp, 
+    get15MinSlotInHour, 
+    getWeekId,
+    getUniqueWeeks 
+} = require('../utils/helpers');
 
 const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+
+
 
 // ============================================
 // DATA AGGREGATION (same logic as web routes)
@@ -9,7 +19,7 @@ const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 
 function aggregateHeatmapData(snapshots, granularity) {
     const now = Math.floor(Date.now() / 1000);
-    const thirtyDaysAgo = helpers.getThirtyDaysAgo();
+    const thirtyDaysAgo = getThirtyDaysAgo();
     
     if (granularity === '15min') {
         const data = {};
@@ -28,10 +38,10 @@ function aggregateHeatmapData(snapshots, granularity) {
         for (const snapshot of snapshots) {
             if (snapshot.timestamp < thirtyDaysAgo) continue;
             
-            const day = helpers.getDayOfWeek(snapshot.timestamp);
-            const hour = helpers.getHourFromTimestamp(snapshot.timestamp);
-            const slot = helpers.get15MinSlotInHour(snapshot.timestamp);
-            const weekId = helpers.getWeekId(snapshot.timestamp, now);
+            const day = getDayOfWeek(snapshot.timestamp);
+            const hour = getHourFromTimestamp(snapshot.timestamp);
+            const slot = get15MinSlotInHour(snapshot.timestamp);
+            const weekId = getWeekId(snapshot.timestamp, now);
             
             if (!data[hour][day][slot].weeklyUnique[weekId]) {
                 data[hour][day][slot].weeklyUnique[weekId] = new Set();
@@ -84,9 +94,9 @@ function aggregateHeatmapData(snapshots, granularity) {
         for (const snapshot of snapshots) {
             if (snapshot.timestamp < thirtyDaysAgo) continue;
             
-            const day = helpers.getDayOfWeek(snapshot.timestamp);
-            const hour = helpers.getHourFromTimestamp(snapshot.timestamp);
-            const weekId = helpers.getWeekId(snapshot.timestamp, now);
+            const day = getDayOfWeek(snapshot.timestamp);
+            const hour = getHourFromTimestamp(snapshot.timestamp);
+            const weekId = getWeekId(snapshot.timestamp, now);
             
             if (!data[hour][day][weekId]) {
                 data[hour][day][weekId] = new Set();
@@ -127,7 +137,7 @@ function aggregateHeatmapData(snapshots, granularity) {
 }
 
 function aggregateMemberHeatmapData(snapshots, memberId, granularity) {
-    const thirtyDaysAgo = helpers.getThirtyDaysAgo();
+    const thirtyDaysAgo = getThirtyDaysAgo();
     const now = Math.floor(Date.now() / 1000);
     
     if (granularity === '15min') {
@@ -153,9 +163,9 @@ function aggregateMemberHeatmapData(snapshots, memberId, granularity) {
             if (processed.has(key)) continue;
             processed.add(key);
             
-            const day = helpers.getDayOfWeek(snapshot.timestamp);
-            const hour = helpers.getHourFromTimestamp(snapshot.timestamp);
-            const slot = helpers.get15MinSlotInHour(snapshot.timestamp);
+            const day = getDayOfWeek(snapshot.timestamp);
+            const hour = getHourFromTimestamp(snapshot.timestamp);
+            const slot = get15MinSlotInHour(snapshot.timestamp);
             
             data[hour][day][slot].total++;
             if (snapshot.active.includes(memberId)) {
@@ -190,9 +200,9 @@ function aggregateMemberHeatmapData(snapshots, memberId, granularity) {
         for (const snapshot of snapshots) {
             if (snapshot.timestamp < thirtyDaysAgo) continue;
             
-            const day = helpers.getDayOfWeek(snapshot.timestamp);
-            const hour = helpers.getHourFromTimestamp(snapshot.timestamp);
-            const weekId = `${snapshot.factionId || 0}-${helpers.getWeekId(snapshot.timestamp, now)}`;
+            const day = getDayOfWeek(snapshot.timestamp);
+            const hour = getHourFromTimestamp(snapshot.timestamp);
+            const weekId = `${snapshot.factionId || 0}-${getWeekId(snapshot.timestamp, now)}`;
             
             data[hour][day].weeksWithData.add(weekId);
             if (snapshot.active.includes(memberId)) {
@@ -216,7 +226,7 @@ function aggregateMemberHeatmapData(snapshots, memberId, granularity) {
 }
 
 function calculateMemberStats(snapshots, memberId) {
-    const thirtyDaysAgo = helpers.getThirtyDaysAgo();
+    const thirtyDaysAgo = getThirtyDaysAgo();
     const sevenDaysAgo = Math.floor(Date.now() / 1000) - (7 * 24 * 60 * 60);
     
     let total30d = 0, active30d = 0;
@@ -903,7 +913,7 @@ async function generateFactionHTML(factionId) {
     }
     
     const latest = snapshots[snapshots.length - 1];
-    const numWeeks = helpers.getUniqueWeeks(snapshots, Math.floor(Date.now() / 1000));
+    const numWeeks = getUniqueWeeks(snapshots, Math.floor(Date.now() / 1000));
     
     // Get heatmap data
     const heatmap = aggregateHeatmapData(snapshots, 'hourly');
@@ -1043,7 +1053,7 @@ async function generateMemberHTML(memberId) {
     const heatmap15Min = aggregateMemberHeatmapData(allSnapshots, memberId, '15min');
     const stats = calculateMemberStats(allSnapshots, memberId);
     
-    const numWeeks = helpers.getUniqueWeeks(allSnapshots, Math.floor(Date.now() / 1000));
+    const numWeeks = getUniqueWeeks(allSnapshots, Math.floor(Date.now() / 1000));
     
     const data = {
         heatmap,

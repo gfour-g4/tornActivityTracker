@@ -1,12 +1,8 @@
 const storage = require('./storage');
+const config = require('../config');
+const { apiLog } = require('./logger');
 
 const API_BASE = 'https://api.torn.com';
-const MAX_RETRIES = 3;
-const RETRY_DELAY = 1000;
-
-// Rate limiting: 20 calls per minute per key
-const RATE_LIMIT_PER_KEY = 20;
-const RATE_LIMIT_WINDOW = 60 * 1000;
 
 const apiCallLog = new Map();
 
@@ -17,7 +13,7 @@ async function sleep(ms) {
 function cleanOldCalls(key) {
     const now = Date.now();
     const calls = apiCallLog.get(key) || [];
-    const recentCalls = calls.filter(t => now - t < RATE_LIMIT_WINDOW);
+    const recentCalls = calls.filter(t => now - t < config.api.rateLimitWindowMs);
     apiCallLog.set(key, recentCalls);
     return recentCalls;
 }
@@ -34,52 +30,50 @@ function logCall(key) {
 
 function getTimeUntilSlotAvailable(key) {
     const calls = cleanOldCalls(key);
-    if (calls.length < RATE_LIMIT_PER_KEY) {
+    if (calls.length < config.api.callsPerKeyPerMinute) {
         return 0;
     }
     const oldestCall = Math.min(...calls);
-    const timeUntilExpiry = (oldestCall + RATE_LIMIT_WINDOW) - Date.now();
+    const timeUntilExpiry = (oldestCall + config.api.rateLimitWindowMs) - Date.now();
     return Math.max(0, timeUntilExpiry + 100);
 }
 
 function findAvailableKey(excludeKeys = []) {
-    const config = storage.loadConfig();
+    const storageConfig = storage.loadConfig();
     
-    if (config.apikeys.length === 0) {
+    if (storageConfig.apikeys.length === 0) {
         return { key: null, waitTime: 0 };
     }
     
     const now = Date.now();
-    config.failedKeys = config.failedKeys || {};
+    storageConfig.failedKeys = storageConfig.failedKeys || {};
     
     // Clean up old failures
     let changed = false;
-    for (const key of Object.keys(config.failedKeys)) {
-        if (now - config.failedKeys[key] > 5 * 60 * 1000) {
-            delete config.failedKeys[key];
+    for (const key of Object.keys(storageConfig.failedKeys)) {
+        if (now - storageConfig.failedKeys[key] > config.api.failedKeyTimeoutMs) {
+            delete storageConfig.failedKeys[key];
             changed = true;
         }
     }
     if (changed) {
-        storage.saveConfig(config);
+        storage.saveConfig(storageConfig);
     }
     
-    // Find available keys
-    const availableKeys = config.apikeys.filter(k => 
-        !excludeKeys.includes(k) && !config.failedKeys[k]
+    const availableKeys = storageConfig.apikeys.filter(k => 
+        !excludeKeys.includes(k) && !storageConfig.failedKeys[k]
     );
     
     if (availableKeys.length === 0) {
-        if (Object.keys(config.failedKeys).length > 0) {
-            config.failedKeys = {};
-            storage.saveConfig(config);
-            const key = config.apikeys.find(k => !excludeKeys.includes(k));
+        if (Object.keys(storageConfig.failedKeys).length > 0) {
+            storageConfig.failedKeys = {};
+            storage.saveConfig(storageConfig);
+            const key = storageConfig.apikeys.find(k => !excludeKeys.includes(k));
             return { key: key || null, waitTime: 0 };
         }
         return { key: null, waitTime: 0 };
     }
     
-    // Find key with most capacity (lowest usage)
     let bestKey = null;
     let lowestWait = Infinity;
     let lowestUsage = Infinity;
@@ -88,19 +82,16 @@ function findAvailableKey(excludeKeys = []) {
         const usage = getCallCount(key);
         const waitTime = getTimeUntilSlotAvailable(key);
         
-        // Prefer keys that don't need waiting
         if (waitTime === 0 && usage < lowestUsage) {
             lowestUsage = usage;
             bestKey = key;
             lowestWait = 0;
         } else if (lowestWait > 0 && waitTime < lowestWait) {
-            // If all keys need waiting, pick the one with shortest wait
             lowestWait = waitTime;
             bestKey = key;
         }
     }
     
-    // If no key found without wait, use the one with shortest wait
     if (!bestKey && availableKeys.length > 0) {
         bestKey = availableKeys[0];
         lowestWait = getTimeUntilSlotAvailable(bestKey);
@@ -116,11 +107,13 @@ async function fetchWithRetry(url, context = '', usedKeys = [], attempt = 1) {
         throw new Error('No API keys available. All keys may have failed.');
     }
     
-    // Wait if needed
     if (waitTime > 0) {
         const keyHint = apiKey.slice(-4);
-        const waitSec = Math.ceil(waitTime / 1000);
-        console.log(`[API] Waiting ${waitSec}s for rate limit (key ...${keyHint})${context ? ` - ${context}` : ''}`);
+        apiLog.debug({ 
+            waitMs: waitTime, 
+            key: `...${keyHint}`, 
+            context 
+        }, 'Waiting for rate limit');
         await sleep(waitTime);
     }
     
@@ -143,11 +136,11 @@ async function fetchWithRetry(url, context = '', usedKeys = [], attempt = 1) {
             const errorMsg = data.error.error;
             
             if ([1, 2, 10, 13].includes(errorCode)) {
-                console.error(`[API] Key error (${errorCode}): ${errorMsg}. Trying next key...`);
+                apiLog.warn({ errorCode, errorMsg }, 'Key error, trying next key');
                 storage.markKeyFailed(apiKey);
                 
-                if (attempt < MAX_RETRIES && usedKeys.length + 1 < storage.loadConfig().apikeys.length) {
-                    await sleep(RETRY_DELAY);
+                if (attempt < config.api.retryAttempts && usedKeys.length + 1 < storage.loadConfig().apikeys.length) {
+                    await sleep(config.api.retryDelayMs);
                     return fetchWithRetry(url, context, [...usedKeys, apiKey], attempt + 1);
                 }
                 
@@ -155,7 +148,7 @@ async function fetchWithRetry(url, context = '', usedKeys = [], attempt = 1) {
             }
             
             if (errorCode === 5) {
-                console.log('[API] Torn rate limit hit. Waiting 30 seconds...');
+                apiLog.warn('Torn rate limit hit, waiting 30 seconds');
                 await sleep(30000);
                 return fetchWithRetry(url, context, usedKeys, attempt);
             }
@@ -177,11 +170,11 @@ async function fetchWithRetry(url, context = '', usedKeys = [], attempt = 1) {
             error.message.includes('ECONNREFUSED') ||
             error.message.includes('ENOTFOUND')) {
             
-            console.error(`[API] Network error: ${error.message}. Trying next key...`);
+            apiLog.error({ error: error.message }, 'Network error, trying next key');
             storage.markKeyFailed(apiKey);
             
-            if (attempt < MAX_RETRIES) {
-                await sleep(RETRY_DELAY);
+            if (attempt < config.api.retryAttempts) {
+                await sleep(config.api.retryDelayMs);
                 return fetchWithRetry(url, context, [...usedKeys, apiKey], attempt + 1);
             }
         }
@@ -225,12 +218,11 @@ async function fetchAllHOF(progressCallback = null) {
                 hasMore = false;
             }
             
-            if (allFactions.length >= 5000) {
+            if (allFactions.length >= config.hof.maxFactions) {
                 hasMore = false;
             }
             
-            // Delay between pages
-            await sleep(500);
+            await sleep(config.hof.pageFetchDelayMs);
         }
     }
     
@@ -249,7 +241,7 @@ function processActivitySnapshot(factionData, pollTimestamp) {
         const lastAction = memberData.last_action?.timestamp || 0;
         const timeDiff = pollTimestamp - lastAction;
         
-        if (timeDiff <= 900) {
+        if (timeDiff <= config.collection.activeThresholdSeconds) {
             activeMembers.push(id);
         }
     }
@@ -263,18 +255,18 @@ function processActivitySnapshot(factionData, pollTimestamp) {
 }
 
 function getRateLimitStatus() {
-    const config = storage.loadConfig();
+    const storageConfig = storage.loadConfig();
     const status = {};
     
-    for (const key of config.apikeys) {
+    for (const key of storageConfig.apikeys) {
         const masked = `...${key.slice(-4)}`;
         const calls = getCallCount(key);
-        const isFailed = config.failedKeys && config.failedKeys[key];
+        const isFailed = storageConfig.failedKeys && storageConfig.failedKeys[key];
         
         status[masked] = {
             calls,
-            limit: RATE_LIMIT_PER_KEY,
-            available: RATE_LIMIT_PER_KEY - calls,
+            limit: config.api.callsPerKeyPerMinute,
+            available: config.api.callsPerKeyPerMinute - calls,
             failed: !!isFailed
         };
     }
@@ -283,21 +275,20 @@ function getRateLimitStatus() {
 }
 
 function estimateCollectionTime(factionCount) {
-    const config = storage.loadConfig();
-    const keyCount = config.apikeys.length;
+    const storageConfig = storage.loadConfig();
+    const keyCount = storageConfig.apikeys.length;
     
     if (keyCount === 0) return Infinity;
     
-    const totalCallsPerMinute = keyCount * RATE_LIMIT_PER_KEY;
+    const totalCallsPerMinute = keyCount * config.api.callsPerKeyPerMinute;
     const minutes = factionCount / totalCallsPerMinute;
     
     return Math.ceil(minutes * 60);
 }
 
-// Clear rate limit tracking (useful for debugging)
 function clearRateLimitLog() {
     apiCallLog.clear();
-    console.log('[API] Rate limit log cleared');
+    apiLog.info('Rate limit log cleared');
 }
 
 module.exports = {
@@ -308,5 +299,5 @@ module.exports = {
     getRateLimitStatus,
     estimateCollectionTime,
     clearRateLimitLog,
-    RATE_LIMIT_PER_KEY
+    RATE_LIMIT_PER_KEY: config.api.callsPerKeyPerMinute
 };
