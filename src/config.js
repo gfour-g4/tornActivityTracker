@@ -3,7 +3,6 @@ module.exports = {
     collection: {
         intervalMs: 15 * 60 * 1000,           // 15 minutes
         dataRetentionDays: 30,
-        activeThresholdSeconds: 900,           // 15 min = "active"
     },
     
     // API rate limiting
