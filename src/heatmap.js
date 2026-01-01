@@ -44,13 +44,31 @@ function getTextColor(value, min, max) {
     return ratio > 0.3 ? '#000000' : '#FFFFFF';
 }
 
+function formatLastUpdated(timestampMs) {
+    if (!timestampMs) return 'Never';
+    
+    const now = Date.now();
+    const diffMs = now - timestampMs;
+    const diffMins = Math.floor(diffMs / 60000);
+    const diffHours = Math.floor(diffMs / 3600000);
+    const diffDays = Math.floor(diffMs / 86400000);
+    
+    if (diffMins < 1) return 'Just now';
+    if (diffMins < 60) return `${diffMins}m ago`;
+    if (diffHours < 24) return `${diffHours}h ago`;
+    if (diffDays < 7) return `${diffDays}d ago`;
+    
+    const date = new Date(timestampMs);
+    return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+}
+
 // ============================================
 // FAST AGGREGATION (using pre-computed data)
 // ============================================
 
-function aggregateFactionDataHourlyFast(factionId, dayFilter) {
+function aggregateFactionDataHourlyFast(factionId, dayFilter, dataTimestamp) {
     const cacheKey = `faction:hourly:${factionId}:${dayFilter}`;
-    const cached = aggregateCache.get(cacheKey);
+    const cached = aggregateCache.get(cacheKey, dataTimestamp);
     if (cached) return cached;
     
     const daysToShow = parseDaysFilter(dayFilter);
@@ -91,9 +109,9 @@ function aggregateFactionDataHourlyFast(factionId, dayFilter) {
     return output;
 }
 
-function aggregateFactionData15MinFast(factionId, dayFilter) {
+function aggregateFactionData15MinFast(factionId, dayFilter, dataTimestamp) {
     const cacheKey = `faction:15min:${factionId}:${dayFilter}`;
-    const cached = aggregateCache.get(cacheKey);
+    const cached = aggregateCache.get(cacheKey, dataTimestamp);
     if (cached) return cached;
     
     const daysToShow = parseDaysFilter(dayFilter);
@@ -139,9 +157,9 @@ function aggregateFactionData15MinFast(factionId, dayFilter) {
 // USER AGGREGATION (needs raw snapshots)
 // ============================================
 
-function aggregateUserDataHourlyMultiFaction(userId, dayFilter) {
+function aggregateUserDataHourlyMultiFaction(userId, dayFilter, dataTimestamp) {
     const cacheKey = `user:hourly:${userId}:${dayFilter}`;
-    const cached = aggregateCache.get(cacheKey);
+    const cached = aggregateCache.get(cacheKey, dataTimestamp);
     if (cached) return cached;
     
     const daysToShow = parseDaysFilter(dayFilter);
@@ -202,9 +220,9 @@ function aggregateUserDataHourlyMultiFaction(userId, dayFilter) {
     return output;
 }
 
-function aggregateUserData15MinMultiFaction(userId, dayFilter) {
+function aggregateUserData15MinMultiFaction(userId, dayFilter, dataTimestamp) {
     const cacheKey = `user:15min:${userId}:${dayFilter}`;
-    const cached = aggregateCache.get(cacheKey);
+    const cached = aggregateCache.get(cacheKey, dataTimestamp);
     if (cached) return cached;
     
     const daysToShow = parseDaysFilter(dayFilter);
@@ -281,7 +299,7 @@ function aggregateUserData15MinMultiFaction(userId, dayFilter) {
 // IMAGE GENERATION
 // ============================================
 
-function generateHeatmapImage(title, aggregatedData, subtitle = '') {
+function generateHeatmapImage(title, aggregatedData, subtitle = '', lastUpdated = null) {
     const { data, min, max, days, isPercentage } = aggregatedData;
     
     const cellWidth = 55;
@@ -290,10 +308,11 @@ function generateHeatmapImage(title, aggregatedData, subtitle = '') {
     const headerHeight = 50;
     const titleHeight = subtitle ? 65 : 45;
     const legendHeight = 40;
+    const footerHeight = lastUpdated ? 25 : 0;
     const padding = 20;
     
     const width = labelWidth + (days.length * cellWidth) + padding * 2;
-    const height = titleHeight + headerHeight + (24 * cellHeight) + legendHeight + padding * 2;
+    const height = titleHeight + headerHeight + (24 * cellHeight) + legendHeight + footerHeight + padding * 2;
     
     const canvas = createCanvas(width, height);
     const ctx = canvas.getContext('2d');
@@ -353,7 +372,7 @@ function generateHeatmapImage(title, aggregatedData, subtitle = '') {
         });
     }
     
-    const legendY = height - legendHeight - padding + 10;
+    const legendY = padding + titleHeight + headerHeight + (24 * cellHeight) + 10;
     const legendWidth = 200;
     const legendX = (width - legendWidth) / 2;
     
@@ -377,10 +396,18 @@ function generateHeatmapImage(title, aggregatedData, subtitle = '') {
     ctx.fillText(minLabel, legendX, legendY + 28);
     ctx.fillText(maxLabel, legendX + legendWidth, legendY + 28);
     
+    // Last updated footer
+    if (lastUpdated) {
+        ctx.fillStyle = '#666666';
+        ctx.font = '10px Arial';
+        ctx.textAlign = 'right';
+        ctx.fillText(`Updated: ${formatLastUpdated(lastUpdated)}`, width - padding, height - padding + 5);
+    }
+    
     return canvas.toBuffer('image/png');
 }
 
-function generateCompact15MinImage(title, aggregatedData, subtitle = '') {
+function generateCompact15MinImage(title, aggregatedData, subtitle = '', lastUpdated = null) {
     const { data, min, max, days, isPercentage } = aggregatedData;
     
     const cellWidth = 75;
@@ -389,10 +416,11 @@ function generateCompact15MinImage(title, aggregatedData, subtitle = '') {
     const headerHeight = 50;
     const titleHeight = subtitle ? 65 : 45;
     const legendHeight = 50;
+    const footerHeight = lastUpdated ? 25 : 0;
     const padding = 20;
     
     const width = labelWidth + (days.length * cellWidth) + padding * 2;
-    const height = titleHeight + headerHeight + (24 * cellHeight) + legendHeight + padding * 2;
+    const height = titleHeight + headerHeight + (24 * cellHeight) + legendHeight + footerHeight + padding * 2;
     
     const canvas = createCanvas(width, height);
     const ctx = canvas.getContext('2d');
@@ -452,7 +480,7 @@ function generateCompact15MinImage(title, aggregatedData, subtitle = '') {
         });
     }
     
-    const legendY = height - legendHeight - padding + 10;
+    const legendY = padding + titleHeight + headerHeight + (24 * cellHeight) + 10;
     ctx.fillStyle = '#FFFFFF';
     ctx.font = '11px Arial';
     ctx.textAlign = 'center';
@@ -482,10 +510,18 @@ function generateCompact15MinImage(title, aggregatedData, subtitle = '') {
     ctx.fillText(minLabel, gradX, legendY + 35);
     ctx.fillText(maxLabel, gradX + gradWidth, legendY + 35);
     
+    // Last updated footer
+    if (lastUpdated) {
+        ctx.fillStyle = '#666666';
+        ctx.font = '10px Arial';
+        ctx.textAlign = 'right';
+        ctx.fillText(`Updated: ${formatLastUpdated(lastUpdated)}`, width - padding, height - padding + 5);
+    }
+    
     return canvas.toBuffer('image/png');
 }
 
-function generateComparisonImage(title1, data1, title2, data2) {
+function generateComparisonImage(title1, data1, title2, data2, lastUpdated1 = null, lastUpdated2 = null) {
     const days = data1.days;
     const is15Min = data1.is15Min;
     
@@ -495,11 +531,12 @@ function generateComparisonImage(title1, data1, title2, data2) {
     const headerHeight = 45;
     const titleHeight = 35;
     const gapWidth = 25;
+    const footerHeight = 25;
     const padding = 15;
     const sectionWidth = labelWidth + (days.length * cellWidth);
     
     const width = (sectionWidth * 2) + gapWidth + padding * 2;
-    const height = titleHeight + headerHeight + (24 * cellHeight) + padding * 2 + 30;
+    const height = titleHeight + headerHeight + (24 * cellHeight) + padding * 2 + 30 + footerHeight;
     
     const canvas = createCanvas(width, height);
     const ctx = canvas.getContext('2d');
@@ -510,13 +547,21 @@ function generateComparisonImage(title1, data1, title2, data2) {
     const globalMin = Math.min(data1.min, data2.min);
     const globalMax = Math.max(data1.max, data2.max);
     
-    function drawSection(data, title, offsetX) {
+    function drawSection(data, title, offsetX, lastUpdated) {
         ctx.fillStyle = '#FFFFFF';
         ctx.font = 'bold 13px Arial';
         ctx.textAlign = 'center';
         ctx.fillText(title, offsetX + sectionWidth / 2, padding + 20);
         
+        // Show last updated under title
+        if (lastUpdated) {
+            ctx.fillStyle = '#666666';
+            ctx.font = '9px Arial';
+            ctx.fillText(`(${formatLastUpdated(lastUpdated)})`, offsetX + sectionWidth / 2, padding + 32);
+        }
+        
         ctx.font = 'bold 10px Arial';
+        ctx.fillStyle = '#FFFFFF';
         days.forEach((day, i) => {
             const x = offsetX + labelWidth + (i * cellWidth) + cellWidth / 2;
             ctx.fillText(DAY_LABELS[day], x, padding + titleHeight + 22);
@@ -571,13 +616,13 @@ function generateComparisonImage(title1, data1, title2, data2) {
         }
     }
     
-    drawSection(data1, title1, padding);
-    drawSection(data2, title2, padding + sectionWidth + gapWidth);
+    drawSection(data1, title1, padding, lastUpdated1);
+    drawSection(data2, title2, padding + sectionWidth + gapWidth, lastUpdated2);
     
     return canvas.toBuffer('image/png');
 }
 
-function generateDifferenceImage(title1, data1, title2, data2) {
+function generateDifferenceImage(title1, data1, title2, data2, lastUpdated = null) {
     const days = data1.days;
     const is15Min = data1.is15Min;
     
@@ -587,10 +632,11 @@ function generateDifferenceImage(title1, data1, title2, data2) {
     const headerHeight = 50;
     const titleHeight = 45;
     const legendHeight = 50;
+    const footerHeight = lastUpdated ? 25 : 0;
     const padding = 20;
     
     const width = labelWidth + (days.length * cellWidth) + padding * 2;
-    const height = titleHeight + headerHeight + (24 * cellHeight) + legendHeight + padding * 2;
+    const height = titleHeight + headerHeight + (24 * cellHeight) + legendHeight + footerHeight + padding * 2;
     
     const canvas = createCanvas(width, height);
     const ctx = canvas.getContext('2d');
@@ -692,22 +738,32 @@ function generateDifferenceImage(title1, data1, title2, data2) {
         });
     }
     
-    const legendY = height - legendHeight - padding + 15;
+    const legendY = padding + titleHeight + headerHeight + (24 * cellHeight) + 15;
     ctx.fillStyle = '#FFFFFF';
     ctx.font = '12px Arial';
     ctx.textAlign = 'center';
     ctx.fillText(`Green = ${title1} higher | Red = ${title2} higher`, width / 2, legendY + 15);
     
+    // Last updated footer
+    if (lastUpdated) {
+        ctx.fillStyle = '#666666';
+        ctx.font = '10px Arial';
+        ctx.textAlign = 'right';
+        ctx.fillText(`Updated: ${formatLastUpdated(lastUpdated)}`, width - padding, height - padding + 5);
+    }
+    
     return canvas.toBuffer('image/png');
 }
 
 // ============================================
-// PUBLIC API (with caching)
+// PUBLIC API (with cache invalidation)
 // ============================================
 
 async function createFactionHeatmap(factionId, granularity, dayFilter) {
+    const lastUpdated = db.getFactionLastUpdated(factionId);
+    
     const cacheKey = `img:faction:${factionId}:${granularity}:${dayFilter}`;
-    const cached = heatmapCache.get(cacheKey);
+    const cached = heatmapCache.get(cacheKey, lastUpdated);
     if (cached) return cached;
     
     const faction = db.getFaction(factionId);
@@ -722,11 +778,11 @@ async function createFactionHeatmap(factionId, granularity, dayFilter) {
     
     let buffer;
     if (granularity === '15min') {
-        const aggregated = aggregateFactionData15MinFast(factionId, dayFilter);
-        buffer = generateCompact15MinImage(title, aggregated, subtitle);
+        const aggregated = aggregateFactionData15MinFast(factionId, dayFilter, lastUpdated);
+        buffer = generateCompact15MinImage(title, aggregated, subtitle, lastUpdated);
     } else {
-        const aggregated = aggregateFactionDataHourlyFast(factionId, dayFilter);
-        buffer = generateHeatmapImage(title, aggregated, subtitle);
+        const aggregated = aggregateFactionDataHourlyFast(factionId, dayFilter, lastUpdated);
+        buffer = generateHeatmapImage(title, aggregated, subtitle, lastUpdated);
     }
     
     heatmapCache.set(cacheKey, buffer);
@@ -734,16 +790,18 @@ async function createFactionHeatmap(factionId, granularity, dayFilter) {
 }
 
 async function createUserHeatmap(userId, granularity, dayFilter) {
+    const lastUpdated = db.getUserLastUpdated(userId);
+    
     const cacheKey = `img:user:${userId}:${granularity}:${dayFilter}`;
-    const cached = heatmapCache.get(cacheKey);
+    const cached = heatmapCache.get(cacheKey, lastUpdated);
     if (cached) return cached;
     
     let aggregated;
     
     if (granularity === '15min') {
-        aggregated = aggregateUserData15MinMultiFaction(userId, dayFilter);
+        aggregated = aggregateUserData15MinMultiFaction(userId, dayFilter, lastUpdated);
     } else {
-        aggregated = aggregateUserDataHourlyMultiFaction(userId, dayFilter);
+        aggregated = aggregateUserDataHourlyMultiFaction(userId, dayFilter, lastUpdated);
     }
     
     if (!aggregated) {
@@ -762,9 +820,9 @@ async function createUserHeatmap(userId, granularity, dayFilter) {
     
     let buffer;
     if (granularity === '15min') {
-        buffer = generateCompact15MinImage(title, aggregated, subtitle);
+        buffer = generateCompact15MinImage(title, aggregated, subtitle, lastUpdated);
     } else {
-        buffer = generateHeatmapImage(title, aggregated, subtitle);
+        buffer = generateHeatmapImage(title, aggregated, subtitle, lastUpdated);
     }
     
     heatmapCache.set(cacheKey, buffer);
@@ -772,8 +830,12 @@ async function createUserHeatmap(userId, granularity, dayFilter) {
 }
 
 async function createComparisonHeatmaps(faction1Id, faction2Id, granularity, dayFilter) {
+    const lastUpdated1 = db.getFactionLastUpdated(faction1Id);
+    const lastUpdated2 = db.getFactionLastUpdated(faction2Id);
+    const latestUpdate = Math.max(lastUpdated1, lastUpdated2);
+    
     const cacheKey = `img:compare:${faction1Id}:${faction2Id}:${granularity}:${dayFilter}`;
-    const cached = heatmapCache.get(cacheKey);
+    const cached = heatmapCache.get(cacheKey, latestUpdate);
     if (cached) return cached;
     
     const faction1 = db.getFaction(faction1Id);
@@ -788,15 +850,15 @@ async function createComparisonHeatmaps(faction1Id, faction2Id, granularity, day
     let agg1, agg2;
     
     if (granularity === '15min') {
-        agg1 = aggregateFactionData15MinFast(faction1Id, dayFilter);
-        agg2 = aggregateFactionData15MinFast(faction2Id, dayFilter);
+        agg1 = aggregateFactionData15MinFast(faction1Id, dayFilter, lastUpdated1);
+        agg2 = aggregateFactionData15MinFast(faction2Id, dayFilter, lastUpdated2);
     } else {
-        agg1 = aggregateFactionDataHourlyFast(faction1Id, dayFilter);
-        agg2 = aggregateFactionDataHourlyFast(faction2Id, dayFilter);
+        agg1 = aggregateFactionDataHourlyFast(faction1Id, dayFilter, lastUpdated1);
+        agg2 = aggregateFactionDataHourlyFast(faction2Id, dayFilter, lastUpdated2);
     }
     
-    const sideBySide = generateComparisonImage(name1, agg1, name2, agg2);
-    const difference = generateDifferenceImage(name1, agg1, name2, agg2);
+    const sideBySide = generateComparisonImage(name1, agg1, name2, agg2, lastUpdated1, lastUpdated2);
+    const difference = generateDifferenceImage(name1, agg1, name2, agg2, latestUpdate);
     
     const result = { sideBySide, difference };
     heatmapCache.set(cacheKey, result);

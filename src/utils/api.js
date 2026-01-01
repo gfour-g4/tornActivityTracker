@@ -234,14 +234,18 @@ function processActivitySnapshot(factionData, pollTimestamp) {
     const allMemberIds = [];
     const members = factionData.members || {};
     
+    // Calculate the start of the current 15-min slot
+    const slotDurationSeconds = 15 * 60;
+    const slotStart = Math.floor(pollTimestamp / slotDurationSeconds) * slotDurationSeconds;
+    
     for (const [memberId, memberData] of Object.entries(members)) {
         const id = parseInt(memberId);
         allMemberIds.push(id);
         
         const lastAction = memberData.last_action?.timestamp || 0;
-        const timeDiff = pollTimestamp - lastAction;
         
-        if (timeDiff <= config.collection.activeThresholdSeconds) {
+        // Active if their last action is within the current 15-min slot
+        if (lastAction >= slotStart) {
             activeMembers.push(id);
         }
     }
