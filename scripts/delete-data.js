@@ -5,7 +5,7 @@ const DB_PATH = path.join(__dirname, '../data/activity.db');
 const db = new Database(DB_PATH);
 
 // December 30-31, 2025 timestamps
-const startTimestamp = Math.floor(new Date('2025-12-30T00:00:00Z').getTime() / 1000);
+const startTimestamp = Math.floor(new Date('2025-12-29T00:00:00Z').getTime() / 1000);
 const endTimestamp = Math.floor(new Date('2026-01-01T00:00:00Z').getTime() / 1000);
 
 console.log(`Deleting data between ${new Date(startTimestamp * 1000).toISOString()} and ${new Date(endTimestamp * 1000).toISOString()}`);

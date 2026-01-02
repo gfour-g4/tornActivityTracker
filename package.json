@@ -11,8 +11,8 @@
     "encrypt-keys": "node src/utils/encrypt-keys.js"
   },
   "dependencies": {
+    "@napi-rs/canvas": "^0.1.88",
     "better-sqlite3": "^9.6.0",
-    "canvas": "^2.11.2",
     "discord.js": "^14.14.1",
     "dotenv": "^16.3.1",
     "pino": "^8.17.2",
