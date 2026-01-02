@@ -75,8 +75,7 @@ function aggregateFactionDataHourlyFast(factionId, dayFilter, dataTimestamp) {
     const aggregates = db.getHourlyAggregates(factionId, config.collection.dataRetentionDays);
     
     const result = {};
-    let globalMin = Infinity;
-    let globalMax = -Infinity;
+    let globalMax = 0;
     
     for (let hour = 0; hour < 24; hour++) {
         result[hour] = {};
@@ -94,14 +93,13 @@ function aggregateFactionDataHourlyFast(factionId, dayFilter, dataTimestamp) {
         
         result[row.hour][row.day_of_week] = avg;
         
-        if (avg < globalMin) globalMin = avg;
         if (avg > globalMax) globalMax = avg;
     }
     
     const output = { 
         data: result, 
-        min: globalMin === Infinity ? 0 : globalMin, 
-        max: globalMax === -Infinity ? 0 : globalMax, 
+        min: 0, 
+        max: globalMax, 
         days: daysToShow 
     };
     
@@ -109,44 +107,39 @@ function aggregateFactionDataHourlyFast(factionId, dayFilter, dataTimestamp) {
     return output;
 }
 
-function aggregateFactionData15MinFast(factionId, dayFilter, dataTimestamp) {
-    const cacheKey = `faction:15min:${factionId}:${dayFilter}`;
+function aggregateFactionDataHourlyFast(factionId, dayFilter, dataTimestamp) {
+    const cacheKey = `faction:hourly:${factionId}:${dayFilter}`;
     const cached = aggregateCache.get(cacheKey, dataTimestamp);
     if (cached) return cached;
     
     const daysToShow = parseDaysFilter(dayFilter);
-    const aggregates = db.get15MinAggregates(factionId, config.collection.dataRetentionDays);
+    const aggregates = db.getHourlyAggregates(factionId, config.collection.dataRetentionDays);
     
     const result = {};
-    let globalMin = Infinity;
-    let globalMax = -Infinity;
+    let globalMax = 0;
     
     for (let hour = 0; hour < 24; hour++) {
         result[hour] = {};
         for (const day of daysToShow) {
-            result[hour][day] = [0, 0, 0, 0];
+            result[hour][day] = 0;
         }
     }
     
     for (const row of aggregates) {
         if (!daysToShow.includes(row.day_of_week)) continue;
         
-        const avg = row.total_snapshots > 0 
-            ? Math.round(row.total_active / row.total_snapshots * 10) / 10 
-            : 0;
+        const avg = row.avg_unique || 0;
         
-        result[row.hour][row.day_of_week][row.slot] = avg;
+        result[row.hour][row.day_of_week] = avg;
         
-        if (avg < globalMin) globalMin = avg;
         if (avg > globalMax) globalMax = avg;
     }
     
     const output = { 
         data: result, 
-        min: globalMin === Infinity ? 0 : globalMin, 
-        max: globalMax === -Infinity ? 0 : globalMax, 
-        days: daysToShow,
-        is15Min: true
+        min: 0, 
+        max: globalMax, 
+        days: daysToShow 
     };
     
     aggregateCache.set(cacheKey, output);
