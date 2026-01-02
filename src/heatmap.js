@@ -66,13 +66,13 @@ function formatLastUpdated(timestampMs) {
 // FAST AGGREGATION (using pre-computed data)
 // ============================================
 
-function aggregateFactionDataHourlyFast(factionId, dayFilter, dataTimestamp) {
-    const cacheKey = `faction:hourly:${factionId}:${dayFilter}`;
+function aggregateFactionData15MinFast(factionId, dayFilter, dataTimestamp) {
+    const cacheKey = `faction:15min:${factionId}:${dayFilter}`;
     const cached = aggregateCache.get(cacheKey, dataTimestamp);
     if (cached) return cached;
     
     const daysToShow = parseDaysFilter(dayFilter);
-    const aggregates = db.getHourlyAggregates(factionId, config.collection.dataRetentionDays);
+    const aggregates = db.get15MinAggregates(factionId, config.collection.dataRetentionDays);
     
     const result = {};
     let globalMax = 0;
@@ -80,7 +80,7 @@ function aggregateFactionDataHourlyFast(factionId, dayFilter, dataTimestamp) {
     for (let hour = 0; hour < 24; hour++) {
         result[hour] = {};
         for (const day of daysToShow) {
-            result[hour][day] = 0;
+            result[hour][day] = [0, 0, 0, 0];
         }
     }
     
@@ -91,7 +91,7 @@ function aggregateFactionDataHourlyFast(factionId, dayFilter, dataTimestamp) {
             ? Math.round(row.total_active / row.total_snapshots * 10) / 10 
             : 0;
         
-        result[row.hour][row.day_of_week] = avg;
+        result[row.hour][row.day_of_week][row.slot] = avg;
         
         if (avg > globalMax) globalMax = avg;
     }
@@ -100,7 +100,8 @@ function aggregateFactionDataHourlyFast(factionId, dayFilter, dataTimestamp) {
         data: result, 
         min: 0, 
         max: globalMax, 
-        days: daysToShow 
+        days: daysToShow,
+        is15Min: true
     };
     
     aggregateCache.set(cacheKey, output);
