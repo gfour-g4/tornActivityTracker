@@ -6,6 +6,7 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "NODE_ENV=development node --watch src/index.js",
+    "deploy": "git push && ssh username@192.168.1.100 \"cd C:\\path\\to\\torn-activity-bot && git pull origin main && npm install --production && pm2 restart torn-activity-bot\"",
     "migrate": "node src/utils/migrate.js",
     "generate-key": "node -e \"console.log(require('./src/utils/crypto').generateKey())\"",
     "encrypt-keys": "node src/utils/encrypt-keys.js"
