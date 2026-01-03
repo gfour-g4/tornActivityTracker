@@ -1,4 +1,3 @@
-
 const api = require('./utils/api');
 const storage = require('./utils/storage');
 const hof = require('./utils/hof');
@@ -6,23 +5,24 @@ const db = require('./database');
 const config = require('./config');
 const { collectorLog } = require('./utils/logger');
 
-let collectorInterval = null;
+let collectorTimeout = null;
 let hofInterval = null;
 let isCollecting = false;
+let isShuttingDown = false;
 let lastCollectionStats = null;
 
-async function collectFactionData(factionId) {
+async function collectFactionData(factionId, slotTimestamp) {
     try {
-        const pollTimestamp = Math.floor(Date.now() / 1000);
         const factionData = await api.fetchFaction(factionId);
-        const { active, total, allMemberIds, members } = api.processActivitySnapshot(factionData, pollTimestamp);
+        const { active, total, allMemberIds, members } = api.processActivitySnapshot(factionData, slotTimestamp);
         
         storage.updateMemberNames(members);
         
+        // Use slot timestamp, not current time
         storage.addSnapshot(
             factionId, 
             factionData.name, 
-            pollTimestamp, 
+            slotTimestamp, 
             active, 
             total,
             allMemberIds
@@ -34,9 +34,30 @@ async function collectFactionData(factionId) {
     }
 }
 
+function getCurrentSlotTimestamp() {
+    const now = Math.floor(Date.now() / 1000);
+    const slotDuration = 15 * 60; // 15 minutes
+    return Math.floor(now / slotDuration) * slotDuration;
+}
+
+function getNextSlotTime() {
+    const now = Date.now();
+    const slotDurationMs = 15 * 60 * 1000;
+    const currentSlotStart = Math.floor(now / slotDurationMs) * slotDurationMs;
+    const nextSlotStart = currentSlotStart + slotDurationMs;
+    
+    // Add a small delay (30 seconds) after slot starts to let activity settle
+    return nextSlotStart + 30 * 1000;
+}
+
 async function collectAllFactions() {
     if (isCollecting) {
         collectorLog.warn('Collection already in progress, skipping...');
+        return null;
+    }
+    
+    if (isShuttingDown) {
+        collectorLog.info('Shutdown in progress, skipping collection');
         return null;
     }
     
@@ -47,41 +68,68 @@ async function collectAllFactions() {
     if (storageConfig.factions.length === 0) {
         collectorLog.info('No factions configured to track');
         isCollecting = false;
+        scheduleNextCollection();
         return null;
     }
     
     if (storageConfig.apikeys.length === 0) {
         collectorLog.warn('No API keys configured');
         isCollecting = false;
+        scheduleNextCollection();
         return null;
     }
     
+    const slotTimestamp = getCurrentSlotTimestamp();
     const startTime = Date.now();
     const keyCount = storageConfig.apikeys.length;
-    const concurrency = Math.min(keyCount * 5, config.api.maxConcurrency);
+    const concurrency = Math.min(keyCount * 2, config.api.maxConcurrency);
     
     collectorLog.info({
         factions: storageConfig.factions.length,
         apiKeys: keyCount,
-        concurrency
+        concurrency,
+        slot: new Date(slotTimestamp * 1000).toISOString()
     }, 'Starting parallel collection');
     
     const results = {
         success: 0,
         failed: 0,
+        skipped: 0,
         errors: [],
         startTime,
-        endTime: null
+        endTime: null,
+        slotTimestamp
     };
     
-    const factionQueue = [...storageConfig.factions];
+    // Filter out factions already collected for this slot
+    const factionsToCollect = [];
+    for (const factionId of storageConfig.factions) {
+        if (db.hasSnapshotForSlot(factionId, slotTimestamp)) {
+            results.skipped++;
+        } else {
+            factionsToCollect.push(factionId);
+        }
+    }
+    
+    if (results.skipped > 0) {
+        collectorLog.info({ skipped: results.skipped }, 'Skipped already collected factions');
+    }
+    
+    if (factionsToCollect.length === 0) {
+        collectorLog.info('All factions already collected for this slot');
+        isCollecting = false;
+        scheduleNextCollection();
+        return results;
+    }
+    
+    const factionQueue = [...factionsToCollect];
     let processedCount = 0;
     const totalToProcess = factionQueue.length;
     
     async function processNext() {
-        while (factionQueue.length > 0) {
+        while (factionQueue.length > 0 && !isShuttingDown) {
             const factionId = factionQueue.shift();
-            const result = await collectFactionData(factionId);
+            const result = await collectFactionData(factionId, slotTimestamp);
             processedCount++;
             
             if (result.success) {
@@ -119,13 +167,39 @@ async function collectAllFactions() {
     collectorLog.info({
         success: results.success,
         failed: results.failed,
-        durationSeconds: Math.round(duration)
+        skipped: results.skipped,
+        durationSeconds: Math.round(duration),
+        interrupted: isShuttingDown
     }, 'Collection complete');
     
     lastCollectionStats = results;
     isCollecting = false;
     
+    if (!isShuttingDown) {
+        scheduleNextCollection();
+    }
+    
     return results;
+}
+
+function scheduleNextCollection() {
+    if (collectorTimeout) {
+        clearTimeout(collectorTimeout);
+    }
+    
+    if (isShuttingDown) {
+        return;
+    }
+    
+    const nextTime = getNextSlotTime();
+    const delay = nextTime - Date.now();
+    
+    collectorLog.debug({
+        nextCollection: new Date(nextTime).toISOString(),
+        delayMs: delay
+    }, 'Scheduled next collection');
+    
+    collectorTimeout = setTimeout(collectAllFactions, delay);
 }
 
 async function updateHOFIfNeeded() {
@@ -140,17 +214,19 @@ async function updateHOFIfNeeded() {
 }
 
 function startCollector() {
-    if (collectorInterval) {
+    if (collectorTimeout) {
         collectorLog.warn('Collector already running');
         return;
     }
+    
+    isShuttingDown = false;
     
     const storageConfig = storage.loadConfig();
     
     collectorLog.info({
         factions: storageConfig.factions.length,
         apiKeys: storageConfig.apikeys.length,
-        intervalMinutes: config.collection.intervalMs / 60000
+        intervalMinutes: 15
     }, 'Starting collector');
     
     // Initialize database
@@ -160,25 +236,59 @@ function startCollector() {
     // Update HOF on startup if needed
     updateHOFIfNeeded();
     
-    // Collect immediately on start
-    collectAllFactions();
+    // Check if we should collect now or wait for next slot
+    const currentSlot = getCurrentSlotTimestamp();
+    const storageConfigCheck = storage.loadConfig();
     
-    // Then at configured interval
-    collectorInterval = setInterval(collectAllFactions, config.collection.intervalMs);
+    let needsImmediateCollection = false;
+    for (const factionId of storageConfigCheck.factions) {
+        if (!db.hasSnapshotForSlot(factionId, currentSlot)) {
+            needsImmediateCollection = true;
+            break;
+        }
+    }
+    
+    if (needsImmediateCollection) {
+        collectorLog.info('Missing data for current slot, collecting now');
+        collectAllFactions();
+    } else {
+        collectorLog.info('Current slot already collected, waiting for next slot');
+        scheduleNextCollection();
+    }
     
     // Check HOF daily
     hofInterval = setInterval(updateHOFIfNeeded, 24 * 60 * 60 * 1000);
 }
 
-function stopCollector() {
-    if (collectorInterval) {
-        clearInterval(collectorInterval);
-        collectorInterval = null;
+async function stopCollector() {
+    isShuttingDown = true;
+    
+    if (collectorTimeout) {
+        clearTimeout(collectorTimeout);
+        collectorTimeout = null;
     }
     
     if (hofInterval) {
         clearInterval(hofInterval);
         hofInterval = null;
+    }
+    
+    // Wait for current collection to finish
+    if (isCollecting) {
+        collectorLog.info('Waiting for current collection to finish...');
+        
+        const maxWait = 60000; // 60 seconds max
+        const startWait = Date.now();
+        
+        while (isCollecting && (Date.now() - startWait) < maxWait) {
+            await new Promise(r => setTimeout(r, 500));
+        }
+        
+        if (isCollecting) {
+            collectorLog.warn('Collection did not finish in time, forcing shutdown');
+        } else {
+            collectorLog.info('Collection finished, proceeding with shutdown');
+        }
     }
     
     db.closeDb();
@@ -189,14 +299,16 @@ function getCollectorStatus() {
     const storageConfig = storage.loadConfig();
     
     return {
-        running: collectorInterval !== null,
+        running: collectorTimeout !== null || isCollecting,
         collecting: isCollecting,
+        shuttingDown: isShuttingDown,
         factionCount: storageConfig.factions.length,
         keyCount: storageConfig.apikeys.length,
         rateLimit: config.api.callsPerKeyPerMinute,
         estimatedCollectionTime: api.estimateCollectionTime(storageConfig.factions.length),
         lastCollection: lastCollectionStats,
-        rateLimitStatus: api.getRateLimitStatus()
+        rateLimitStatus: api.getRateLimitStatus(),
+        nextSlot: new Date(getNextSlotTime()).toISOString()
     };
 }
 
@@ -207,4 +319,3 @@ module.exports = {
     collectFactionData,
     getCollectorStatus
 };
-

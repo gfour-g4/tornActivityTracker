@@ -19,6 +19,7 @@ client.commands.set(activityCommand.data.name, activityCommand);
 client.commands.set(exportCommand.data.name, exportCommand);
 
 let presenceInterval = null;
+let isShuttingDown = false;
 
 function updatePresence() {
     try {
@@ -78,6 +79,16 @@ client.once('ready', async () => {
 });
 
 client.on('interactionCreate', async interaction => {
+    if (isShuttingDown) {
+        if (interaction.isRepliable()) {
+            await interaction.reply({
+                content: '⚠️ Bot is shutting down, please try again later.',
+                ephemeral: true
+            });
+        }
+        return;
+    }
+    
     if (interaction.isAutocomplete()) {
         const command = client.commands.get(interaction.commandName);
         
@@ -119,20 +130,49 @@ client.on('interactionCreate', async interaction => {
     }
 });
 
-function shutdown() {
-    botLog.info('Shutting down...');
+async function shutdown(signal) {
+    if (isShuttingDown) {
+        botLog.warn('Shutdown already in progress');
+        return;
+    }
+    
+    isShuttingDown = true;
+    botLog.info({ signal }, 'Shutdown initiated');
+    
+    // Update presence to show shutting down
+    try {
+        client.user.setActivity('Shutting down...', { type: ActivityType.Playing });
+    } catch (e) {}
     
     if (presenceInterval) {
         clearInterval(presenceInterval);
+        presenceInterval = null;
     }
     
-    collector.stopCollector();
+    // Stop collector gracefully (waits for collection to finish)
+    await collector.stopCollector();
+    
+    // Close database
     db.closeDb();
+    
+    // Destroy Discord client
     client.destroy();
+    
+    botLog.info('Shutdown complete');
     process.exit(0);
 }
 
-process.on('SIGINT', shutdown);
-process.on('SIGTERM', shutdown);
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+
+// Handle uncaught errors gracefully
+process.on('uncaughtException', (error) => {
+    botLog.fatal({ error: error.message, stack: error.stack }, 'Uncaught exception');
+    shutdown('uncaughtException');
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+    botLog.error({ reason: String(reason) }, 'Unhandled rejection');
+});
 
 client.login(process.env.DISCORD_TOKEN);

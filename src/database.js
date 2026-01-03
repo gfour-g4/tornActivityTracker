@@ -540,6 +540,25 @@ function getDbStats() {
     };
 }
 
+// ============================================
+// HELPER FUNCTIONS
+// ============================================
+
+
+function hasSnapshotForSlot(factionId, slotTimestamp) {
+    // Check if we have a snapshot within 1 minute of this slot
+    // (to handle slight timing variations)
+    const row = getDb().prepare(`
+        SELECT 1 FROM snapshots 
+        WHERE faction_id = ? 
+        AND timestamp >= ? 
+        AND timestamp < ?
+        LIMIT 1
+    `).get(factionId, slotTimestamp, slotTimestamp + 60);
+    
+    return !!row;
+}
+
 module.exports = {
     getDb,
     closeDb,
@@ -584,4 +603,7 @@ module.exports = {
     // lastupdate
     getFactionLastUpdated,
     getUserLastUpdated,
+
+    // Slot check
+    hasSnapshotForSlot
 };
