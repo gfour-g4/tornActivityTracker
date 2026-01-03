@@ -1,27 +1,30 @@
 ================================================================================
 EXPORTED FILES FOR AI CHATBOT
-Export Date: 1/1/2026, 12:35:10 AM
-Total Files: 15
+Export Date: 1/2/2026, 5:15:32 PM
+Total Files: 20
 ================================================================================
 
 File: package.json
 ----------------------------------------
 {
   "name": "torn-activity-bot",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Discord bot to track Torn faction member activity",
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
-    "dev": "node --watch src/index.js",
+    "dev": "NODE_ENV=development node --watch src/index.js",
     "migrate": "node src/utils/migrate.js",
-    "generate-test-data": "node generate-test-data.js"
+    "generate-key": "node -e \"console.log(require('./src/utils/crypto').generateKey())\"",
+    "encrypt-keys": "node src/utils/encrypt-keys.js"
   },
   "dependencies": {
+    "@napi-rs/canvas": "^0.1.88",
     "better-sqlite3": "^9.6.0",
-    "canvas": "^2.11.2",
     "discord.js": "^14.14.1",
-    "dotenv": "^16.3.1"
+    "dotenv": "^16.3.1",
+    "pino": "^8.17.2",
+    "pino-pretty": "^10.3.1"
   },
   "engines": {
     "node": ">=18.0.0"
@@ -33,22 +36,18 @@ File: package.json
 
 File: src/collector.js
 ----------------------------------------
+
 const api = require('./utils/api');
 const storage = require('./utils/storage');
 const hof = require('./utils/hof');
 const db = require('./database');
+const config = require('./config');
+const { collectorLog } = require('./utils/logger');
 
 let collectorInterval = null;
 let hofInterval = null;
 let isCollecting = false;
 let lastCollectionStats = null;
-
-const COLLECTION_INTERVAL = 15 * 60 * 1000; // 15 minutes
-const HOF_UPDATE_INTERVAL = 7 * 24 * 60 * 60 * 1000; // 7 days
-
-async function sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
-}
 
 async function collectFactionData(factionId) {
     try {
@@ -75,34 +74,35 @@ async function collectFactionData(factionId) {
 
 async function collectAllFactions() {
     if (isCollecting) {
-        console.log('[Collector] Collection already in progress, skipping...');
+        collectorLog.warn('Collection already in progress, skipping...');
         return null;
     }
     
     isCollecting = true;
     
-    const config = storage.loadConfig();
+    const storageConfig = storage.loadConfig();
     
-    if (config.factions.length === 0) {
-        console.log('[Collector] No factions configured to track.');
+    if (storageConfig.factions.length === 0) {
+        collectorLog.info('No factions configured to track');
         isCollecting = false;
         return null;
     }
     
-    if (config.apikeys.length === 0) {
-        console.log('[Collector] No API keys configured.');
+    if (storageConfig.apikeys.length === 0) {
+        collectorLog.warn('No API keys configured');
         isCollecting = false;
         return null;
     }
     
     const startTime = Date.now();
-    const keyCount = config.apikeys.length;
-    const concurrency = Math.min(keyCount * 2, 10); // 2 concurrent per key, max 10
+    const keyCount = storageConfig.apikeys.length;
+    const concurrency = Math.min(keyCount * 5, config.api.maxConcurrency);
     
-    console.log(`[${new Date().toISOString()}] Starting parallel collection...`);
-    console.log(`  Factions: ${config.factions.length}`);
-    console.log(`  API Keys: ${keyCount}`);
-    console.log(`  Concurrency: ${concurrency}`);
+    collectorLog.info({
+        factions: storageConfig.factions.length,
+        apiKeys: keyCount,
+        concurrency
+    }, 'Starting parallel collection');
     
     const results = {
         success: 0,
@@ -112,12 +112,10 @@ async function collectAllFactions() {
         endTime: null
     };
     
-    const factionQueue = [...config.factions];
-    
+    const factionQueue = [...storageConfig.factions];
     let processedCount = 0;
     const totalToProcess = factionQueue.length;
     
-    // Parallel processing
     async function processNext() {
         while (factionQueue.length > 0) {
             const factionId = factionQueue.shift();
@@ -127,17 +125,25 @@ async function collectAllFactions() {
             if (result.success) {
                 results.success++;
                 if (totalToProcess <= 20 || processedCount % 50 === 0) {
-                    console.log(`  [${processedCount}/${totalToProcess}] ✓ ${result.name}: ${result.active}/${result.total}`);
+                    collectorLog.debug({
+                        progress: `${processedCount}/${totalToProcess}`,
+                        faction: result.name,
+                        active: result.active,
+                        total: result.total
+                    }, 'Faction collected');
                 }
             } else {
                 results.failed++;
                 results.errors.push({ factionId, error: result.error });
-                console.log(`  [${processedCount}/${totalToProcess}] ✗ ${factionId}: ${result.error}`);
+                collectorLog.error({
+                    progress: `${processedCount}/${totalToProcess}`,
+                    factionId,
+                    error: result.error
+                }, 'Faction collection failed');
             }
         }
     }
     
-    // Start concurrent workers
     const workers = [];
     for (let i = 0; i < concurrency; i++) {
         workers.push(processNext());
@@ -148,10 +154,11 @@ async function collectAllFactions() {
     results.endTime = Date.now();
     const duration = (results.endTime - results.startTime) / 1000;
     
-    console.log(`[${new Date().toISOString()}] Collection complete!`);
-    console.log(`  Success: ${results.success}`);
-    console.log(`  Failed: ${results.failed}`);
-    console.log(`  Duration: ${Math.floor(duration / 60)}m ${Math.floor(duration % 60)}s`);
+    collectorLog.info({
+        success: results.success,
+        failed: results.failed,
+        durationSeconds: Math.round(duration)
+    }, 'Collection complete');
     
     lastCollectionStats = results;
     isCollecting = false;
@@ -161,30 +168,32 @@ async function collectAllFactions() {
 
 async function updateHOFIfNeeded() {
     if (hof.isHOFCacheStale()) {
-        console.log('[Collector] HOF cache is stale, updating...');
+        collectorLog.info('HOF cache is stale, updating...');
         try {
             await hof.updateHOFCache();
         } catch (error) {
-            console.error('[Collector] Failed to update HOF cache:', error.message);
+            collectorLog.error({ error: error.message }, 'Failed to update HOF cache');
         }
     }
 }
 
 function startCollector() {
     if (collectorInterval) {
-        console.log('[Collector] Already running.');
+        collectorLog.warn('Collector already running');
         return;
     }
     
-    const config = storage.loadConfig();
-    console.log(`[Collector] Starting...`);
-    console.log(`  Tracking ${config.factions.length} factions`);
-    console.log(`  Using ${config.apikeys.length} API keys`);
-    console.log(`  Collection interval: 15 minutes`);
+    const storageConfig = storage.loadConfig();
+    
+    collectorLog.info({
+        factions: storageConfig.factions.length,
+        apiKeys: storageConfig.apikeys.length,
+        intervalMinutes: config.collection.intervalMs / 60000
+    }, 'Starting collector');
     
     // Initialize database
     db.getDb();
-    console.log('[DB] Database initialized');
+    collectorLog.info('Database initialized');
     
     // Update HOF on startup if needed
     updateHOFIfNeeded();
@@ -192,8 +201,8 @@ function startCollector() {
     // Collect immediately on start
     collectAllFactions();
     
-    // Then every 15 minutes
-    collectorInterval = setInterval(collectAllFactions, COLLECTION_INTERVAL);
+    // Then at configured interval
+    collectorInterval = setInterval(collectAllFactions, config.collection.intervalMs);
     
     // Check HOF daily
     hofInterval = setInterval(updateHOFIfNeeded, 24 * 60 * 60 * 1000);
@@ -211,19 +220,19 @@ function stopCollector() {
     }
     
     db.closeDb();
-    console.log('[Collector] Stopped.');
+    collectorLog.info('Collector stopped');
 }
 
 function getCollectorStatus() {
-    const config = storage.loadConfig();
+    const storageConfig = storage.loadConfig();
     
     return {
         running: collectorInterval !== null,
         collecting: isCollecting,
-        factionCount: config.factions.length,
-        keyCount: config.apikeys.length,
-        rateLimit: api.RATE_LIMIT_PER_KEY,
-        estimatedCollectionTime: api.estimateCollectionTime(config.factions.length),
+        factionCount: storageConfig.factions.length,
+        keyCount: storageConfig.apikeys.length,
+        rateLimit: config.api.callsPerKeyPerMinute,
+        estimatedCollectionTime: api.estimateCollectionTime(storageConfig.factions.length),
         lastCollection: lastCollectionStats,
         rateLimitStatus: api.getRateLimitStatus()
     };
@@ -237,16 +246,22 @@ module.exports = {
     getCollectorStatus
 };
 
+
+
 ================================================================================
 
 File: src/commands/activity.js
 ----------------------------------------
+
 const { SlashCommandBuilder, AttachmentBuilder, PermissionFlagsBits } = require('discord.js');
 const heatmap = require('../heatmap');
 const storage = require('../utils/storage');
 const hof = require('../utils/hof');
 const api = require('../utils/api');
 const collector = require('../collector');
+const db = require('../database');
+const { resolveMultipleFactions } = require('../utils/helpers');
+const { cmdLog } = require('../utils/logger');
 
 const GRANULARITY_CHOICES = [
     { name: 'Hourly', value: 'hourly' },
@@ -256,6 +271,12 @@ const GRANULARITY_CHOICES = [
 const RANK_CHOICES = [
     { name: 'Platinum', value: 'platinum' },
     { name: 'Diamond', value: 'diamond' }
+];
+
+const LEADERBOARD_PERIOD_CHOICES = [
+    { name: '7 Days', value: '7' },
+    { name: '14 Days', value: '14' },
+    { name: '30 Days', value: '30' }
 ];
 
 module.exports = {
@@ -337,6 +358,25 @@ module.exports = {
                     option
                         .setName('days')
                         .setDescription('Days to include')
+                )
+        )
+        // Leaderboard subcommand
+        .addSubcommand(subcommand =>
+            subcommand
+                .setName('leaderboard')
+                .setDescription('View faction member activity leaderboard')
+                .addStringOption(option =>
+                    option
+                        .setName('faction')
+                        .setDescription('Faction name or ID')
+                        .setRequired(true)
+                        .setAutocomplete(true)
+                )
+                .addStringOption(option =>
+                    option
+                        .setName('period')
+                        .setDescription('Time period')
+                        .addChoices(...LEADERBOARD_PERIOD_CHOICES)
                 )
         )
         // Management subcommands
@@ -459,83 +499,77 @@ module.exports = {
                 .setDescription('Manually refresh the faction Hall of Fame cache')
         ),
 
-        async autocomplete(interaction) {
-            const focusedOption = interaction.options.getFocused(true);
-            const value = focusedOption.value;
-            const subcommand = interaction.options.getSubcommand();
-            
-            let choices = [];
-            
-            if (focusedOption.name === 'user') {
-                if (value.length === 0) {
-                    choices = storage.getAllMemberChoices();
-                } else {
-                    choices = storage.searchMemberByName(value).map(m => ({
-                        name: `${m.name} [${m.id}]`,
-                        value: m.id.toString()
-                    }));
-                }
-            } else if (focusedOption.name === 'factions') {
-                // For add-factions and remove-factions
-                // Get the last item being typed (after last comma)
-                const parts = value.split(',');
-                const current = parts[parts.length - 1].trim();
-                const prefix = parts.slice(0, -1).join(',');
-                
-                if (current.length === 0) {
-                    // Show HOF factions
-                    const hofFactions = hof.loadHOFCache().factions.slice(0, 25);
-                    choices = hofFactions.map(f => ({
-                        name: `${f.name} [${f.id}]`,
-                        value: prefix ? `${prefix},${f.id}` : f.id.toString()
-                    }));
-                } else {
-                    // Search HOF and tracked factions
-                    const hofResults = hof.searchHOFByName(current);
-                    const trackedResults = storage.searchFactionByName(current);
-                    
-                    // Merge results
-                    const seen = new Set();
-                    const merged = [];
-                    
-                    for (const f of [...trackedResults, ...hofResults]) {
-                        if (!seen.has(f.id)) {
-                            merged.push(f);
-                            seen.add(f.id);
-                        }
-                    }
-                    
-                    choices = merged.slice(0, 25).map(f => ({
-                        name: `${f.name} [${f.id}]`,
-                        value: prefix ? `${prefix},${f.id}` : f.id.toString()
-                    }));
-                }
-            } else if (['faction', 'faction1', 'faction2'].includes(focusedOption.name)) {
-                if (value.length === 0) {
-                    choices = storage.getAllFactionChoices();
-                } else {
-                    const tracked = storage.searchFactionByName(value);
-                    const hofResults = hof.searchHOFByName(value);
-                    
-                    const seen = new Set(tracked.map(f => f.id));
-                    const merged = [...tracked];
-                    
-                    for (const f of hofResults) {
-                        if (!seen.has(f.id)) {
-                            merged.push(f);
-                            seen.add(f.id);
-                        }
-                    }
-                    
-                    choices = merged.slice(0, 25).map(f => ({
-                        name: `${f.name} [${f.id}]`,
-                        value: f.id.toString()
-                    }));
-                }
+    async autocomplete(interaction) {
+        const focusedOption = interaction.options.getFocused(true);
+        const value = focusedOption.value;
+        
+        let choices = [];
+        
+        if (focusedOption.name === 'user') {
+            if (value.length === 0) {
+                choices = storage.getAllMemberChoices();
+            } else {
+                choices = storage.searchMemberByName(value).map(m => ({
+                    name: `${m.name} [${m.id}]`,
+                    value: m.id.toString()
+                }));
             }
+        } else if (focusedOption.name === 'factions') {
+            const parts = value.split(',');
+            const current = parts[parts.length - 1].trim();
+            const prefix = parts.slice(0, -1).join(',');
             
-            await interaction.respond(choices.slice(0, 25));
-        },
+            if (current.length === 0) {
+                const hofFactions = hof.loadHOFCache().factions.slice(0, 25);
+                choices = hofFactions.map(f => ({
+                    name: `${f.name} [${f.id}]`,
+                    value: prefix ? `${prefix},${f.id}` : f.id.toString()
+                }));
+            } else {
+                const hofResults = hof.searchHOFByName(current);
+                const trackedResults = storage.searchFactionByName(current);
+                
+                const seen = new Set();
+                const merged = [];
+                
+                for (const f of [...trackedResults, ...hofResults]) {
+                    if (!seen.has(f.id)) {
+                        merged.push(f);
+                        seen.add(f.id);
+                    }
+                }
+                
+                choices = merged.slice(0, 25).map(f => ({
+                    name: `${f.name} [${f.id}]`,
+                    value: prefix ? `${prefix},${f.id}` : f.id.toString()
+                }));
+            }
+        } else if (['faction', 'faction1', 'faction2'].includes(focusedOption.name)) {
+            if (value.length === 0) {
+                choices = storage.getAllFactionChoices();
+            } else {
+                const tracked = storage.searchFactionByName(value);
+                const hofResults = hof.searchHOFByName(value);
+                
+                const seen = new Set(tracked.map(f => f.id));
+                const merged = [...tracked];
+                
+                for (const f of hofResults) {
+                    if (!seen.has(f.id)) {
+                        merged.push(f);
+                        seen.add(f.id);
+                    }
+                }
+                
+                choices = merged.slice(0, 25).map(f => ({
+                    name: `${f.name} [${f.id}]`,
+                    value: f.id.toString()
+                }));
+            }
+        }
+        
+        await interaction.respond(choices.slice(0, 25));
+    },
 
     async execute(interaction) {
         const subcommand = interaction.options.getSubcommand();
@@ -551,6 +585,10 @@ module.exports = {
         
         if (subcommand === 'compare') {
             return await handleCompare(interaction);
+        }
+        
+        if (subcommand === 'leaderboard') {
+            return await handleLeaderboard(interaction);
         }
         
         // Management commands (admin only)
@@ -636,7 +674,7 @@ async function handleFactionHeatmap(interaction) {
         await interaction.editReply({ files: [attachment] });
         
     } catch (error) {
-        console.error('Faction heatmap error:', error);
+        cmdLog.error({ error: error.message, input }, 'Faction heatmap error');
         await interaction.editReply({ content: `❌ Error: ${error.message}` });
     }
 }
@@ -666,7 +704,7 @@ async function handleUserHeatmap(interaction) {
         await interaction.editReply({ files: [attachment] });
         
     } catch (error) {
-        console.error('User heatmap error:', error);
+        cmdLog.error({ error: error.message, input }, 'User heatmap error');
         await interaction.editReply({ content: `❌ Error: ${error.message}` });
     }
 }
@@ -709,7 +747,61 @@ async function handleCompare(interaction) {
         });
         
     } catch (error) {
-        console.error('Compare error:', error);
+        cmdLog.error({ error: error.message }, 'Compare error');
+        await interaction.editReply({ content: `❌ Error: ${error.message}` });
+    }
+}
+
+// ============================================
+// LEADERBOARD HANDLER
+// ============================================
+
+async function handleLeaderboard(interaction) {
+    const input = interaction.options.getString('faction');
+    const period = parseInt(interaction.options.getString('period') || '7');
+    
+    await interaction.deferReply();
+    
+    try {
+        const faction = storage.resolveFaction(input);
+        
+        if (!faction) {
+            return await interaction.editReply({
+                content: `❌ Faction not found: "${input}"\nUse a faction name or ID from the tracked list.`
+            });
+        }
+        
+        const leaderboard = db.getMemberLeaderboard(faction.id, period, 20);
+        
+        if (leaderboard.length === 0) {
+            return await interaction.editReply({
+                content: `❌ No activity data found for **${faction.name}** in the last ${period} days.`
+            });
+        }
+        
+        const totalSnapshots = leaderboard[0]?.total_snapshots || 0;
+        
+        let response = `**📊 ${faction.name} - Activity Leaderboard (${period} Days)**\n`;
+        response += `*${totalSnapshots} data points collected*\n\n`;
+        
+        const medals = ['🥇', '🥈', '🥉'];
+        
+        for (let i = 0; i < leaderboard.length; i++) {
+            const member = leaderboard[i];
+            const percentage = totalSnapshots > 0 
+                ? Math.round((member.times_active / totalSnapshots) * 100) 
+                : 0;
+            
+            const medal = medals[i] || `**${i + 1}.**`;
+            const name = member.name || `User ${member.member_id}`;
+            
+            response += `${medal} ${name} - ${percentage}% (${member.times_active}/${totalSnapshots})\n`;
+        }
+        
+        await interaction.editReply({ content: response });
+        
+    } catch (error) {
+        cmdLog.error({ error: error.message, input }, 'Leaderboard error');
         await interaction.editReply({ content: `❌ Error: ${error.message}` });
     }
 }
@@ -724,7 +816,7 @@ async function handleAddFactions(interaction) {
     await interaction.deferReply({ ephemeral: true });
     
     try {
-        const resolved = resolveMultipleFactions(input);
+        const resolved = resolveMultipleFactions(input, hof, storage);
         
         if (resolved.length === 0) {
             return await interaction.editReply({
@@ -743,7 +835,6 @@ async function handleAddFactions(interaction) {
         
         if (result.added > 0 && resolved.length <= 10) {
             response += '\n\n**Added:**\n' + resolved
-                .filter(f => !storage.loadConfig().factions.includes(f.id) || result.added === resolved.length)
                 .slice(0, result.added)
                 .map(f => `• ${f.name} [${f.id}]${f.members ? ` - ${f.members} members` : ''}`)
                 .join('\n');
@@ -758,10 +849,11 @@ async function handleAddFactions(interaction) {
             response += `\n⚠️ Warning: Collection may not complete in 15 min. Add more API keys.`;
         }
         
+        cmdLog.info({ added: result.added, skipped: result.skipped }, 'Factions added');
         await interaction.editReply({ content: response });
         
     } catch (error) {
-        console.error('Add factions error:', error);
+        cmdLog.error({ error: error.message }, 'Add factions error');
         await interaction.editReply({ content: `❌ Error: ${error.message}` });
     }
 }
@@ -784,7 +876,6 @@ async function handleAddRank(interaction) {
             response += ` (${result.skipped} already tracked)`;
         }
         
-        // Show filter info
         const filters = [];
         if (minMembers) filters.push(`min ${minMembers}`);
         if (maxMembers) filters.push(`max ${maxMembers}`);
@@ -807,14 +898,14 @@ async function handleAddRank(interaction) {
             response += `\n⚠️ Warning: Collection may not complete in 15 min. Add more API keys.`;
         }
         
+        cmdLog.info({ rank, added: result.added, skipped: result.skipped }, 'Rank factions added');
         await interaction.editReply({ content: response });
         
     } catch (error) {
-        console.error('Add rank error:', error);
+        cmdLog.error({ error: error.message }, 'Add rank error');
         await interaction.editReply({ content: `❌ Error: ${error.message}` });
     }
 }
-
 
 async function handleAddKeys(interaction) {
     const keysInput = interaction.options.getString('keys');
@@ -832,6 +923,8 @@ async function handleAddKeys(interaction) {
     
     const result = storage.addApiKeys(keys);
     
+    cmdLog.info({ added: result.added, skipped: result.skipped }, 'API keys added');
+    
     await interaction.reply({
         content: `✅ Added **${result.added}** API key(s)` + 
             (result.skipped > 0 ? ` (${result.skipped} already exist)` : ''),
@@ -845,7 +938,7 @@ async function handleRemoveFactions(interaction) {
     await interaction.deferReply({ ephemeral: true });
     
     try {
-        const resolved = resolveMultipleFactions(input);
+        const resolved = resolveMultipleFactions(input, hof, storage);
         
         if (resolved.length === 0) {
             return await interaction.editReply({
@@ -870,67 +963,13 @@ async function handleRemoveFactions(interaction) {
         const config = storage.loadConfig();
         response += `\n\n📈 Now tracking **${config.factions.length}** factions`;
         
+        cmdLog.info({ removed: result.removed }, 'Factions removed');
         await interaction.editReply({ content: response });
         
     } catch (error) {
-        console.error('Remove factions error:', error);
+        cmdLog.error({ error: error.message }, 'Remove factions error');
         await interaction.editReply({ content: `❌ Error: ${error.message}` });
     }
-}
-
-
-function resolveMultipleFactions(input) {
-    const parts = input.split(',').map(p => p.trim()).filter(p => p.length > 0);
-    const resolved = [];
-    const seen = new Set();
-    
-    for (const part of parts) {
-        // Try as ID first
-        const asNumber = parseInt(part);
-        if (!isNaN(asNumber) && asNumber.toString() === part) {
-            if (!seen.has(asNumber)) {
-                // Try to get name from HOF or storage
-                const hofData = hof.getFactionFromHOF(asNumber);
-                const storageData = storage.loadFactionData(asNumber);
-                
-                resolved.push({
-                    id: asNumber,
-                    name: hofData?.name || storageData?.name || `Faction ${asNumber}`,
-                    members: hofData?.members || null
-                });
-                seen.add(asNumber);
-            }
-            continue;
-        }
-        
-        // Try as name - search HOF first, then tracked
-        const hofResults = hof.searchHOFByName(part);
-        const trackedResults = storage.searchFactionByName(part);
-        
-        // Find exact match first
-        let found = hofResults.find(f => f.name.toLowerCase() === part.toLowerCase());
-        if (!found) {
-            found = trackedResults.find(f => f.name.toLowerCase() === part.toLowerCase());
-        }
-        // If no exact match, use first result
-        if (!found && hofResults.length > 0) {
-            found = hofResults[0];
-        }
-        if (!found && trackedResults.length > 0) {
-            found = trackedResults[0];
-        }
-        
-        if (found && !seen.has(found.id)) {
-            resolved.push({
-                id: found.id,
-                name: found.name,
-                members: found.members || null
-            });
-            seen.add(found.id);
-        }
-    }
-    
-    return resolved;
 }
 
 async function handleRemoveRank(interaction) {
@@ -949,7 +988,6 @@ async function handleRemoveRank(interaction) {
             ? `✅ Removed **${result.removed}** ${rank} faction(s)`
             : `⚠️ No matching ${rank} factions were being tracked.`;
         
-        // Show filter info
         const filters = [];
         if (minMembers) filters.push(`min ${minMembers}`);
         if (maxMembers) filters.push(`max ${maxMembers}`);
@@ -966,10 +1004,11 @@ async function handleRemoveRank(interaction) {
         const config = storage.loadConfig();
         response += `\n\n📈 Now tracking **${config.factions.length}** factions`;
         
+        cmdLog.info({ rank, removed: result.removed }, 'Rank factions removed');
         await interaction.editReply({ content: response });
         
     } catch (error) {
-        console.error('Remove rank error:', error);
+        cmdLog.error({ error: error.message }, 'Remove rank error');
         await interaction.editReply({ content: `❌ Error: ${error.message}` });
     }
 }
@@ -978,6 +1017,10 @@ async function handleRemoveKey(interaction) {
     const key = interaction.options.getString('key');
     
     const result = storage.removeApiKey(key);
+    
+    if (result.removed) {
+        cmdLog.info('API key removed');
+    }
     
     await interaction.reply({
         content: result.removed 
@@ -993,7 +1036,6 @@ async function handleList(interaction) {
     
     let response = '**📊 Activity Tracker Configuration**\n\n';
     
-    // Factions
     response += `**Factions:** ${config.factions.length} tracked\n`;
     
     if (config.factions.length > 0 && config.factions.length <= 20) {
@@ -1006,7 +1048,6 @@ async function handleList(interaction) {
             response += `> • ${name} [${factionId}] - ${rank} - ${snapshots} snapshots\n`;
         }
     } else if (config.factions.length > 20) {
-        // Group by rank
         const byRank = {};
         for (const factionId of config.factions) {
             const hofData = hof.getFactionFromHOF(factionId);
@@ -1019,10 +1060,8 @@ async function handleList(interaction) {
         }
     }
     
-    // API Keys
     response += `\n**API Keys:** ${config.apikeys.length} configured\n`;
     
-    // Collection estimate
     const estimate = api.estimateCollectionTime(config.factions.length);
     response += `\n**Collection:**\n`;
     response += `> Rate limit: ${api.RATE_LIMIT_PER_KEY} calls/min/key\n`;
@@ -1034,7 +1073,6 @@ async function handleList(interaction) {
         response += `\n⚠️ **Warning:** Need ${neededKeys}+ keys to finish in 15 min!\n`;
     }
     
-    // HOF cache
     response += `\n**HOF Cache:**\n`;
     response += `> Total factions: ${hofStats.total}\n`;
     
@@ -1095,10 +1133,12 @@ async function handleCollect(interaction) {
     const config = storage.loadConfig();
     const estimate = api.estimateCollectionTime(config.factions.length);
     
+    cmdLog.info({ factions: config.factions.length }, 'Manual collection triggered');
+    
     await interaction.reply({
         content: `🔄 Starting manual collection of ${config.factions.length} factions...\n` +
             `⏱️ Estimated time: ${Math.ceil(estimate / 60)} minutes\n\n` +
-            `Check console for progress.`,
+            `Check logs for progress.`,
         ephemeral: true
     });
     
@@ -1109,10 +1149,9 @@ async function handleRefreshHOF(interaction) {
     await interaction.deferReply({ ephemeral: true });
     
     try {
-        let lastUpdate = '';
-        const cache = await hof.updateHOFCache((page, count) => {
-            lastUpdate = `📥 Fetching page ${page}... (${count} factions)`;
-        });
+        cmdLog.info('Manual HOF refresh triggered');
+        
+        await hof.updateHOFCache();
         
         const stats = hof.getHOFStats();
         
@@ -1127,7 +1166,7 @@ async function handleRefreshHOF(interaction) {
         await interaction.editReply({ content: response });
         
     } catch (error) {
-        console.error('Refresh HOF error:', error);
+        cmdLog.error({ error: error.message }, 'Refresh HOF error');
         await interaction.editReply({ content: `❌ Error: ${error.message}` });
     }
 }
@@ -1136,7 +1175,7 @@ async function handleRefreshHOF(interaction) {
 
 File: src/heatmap.js
 ----------------------------------------
-const { createCanvas } = require('canvas');
+const { createCanvas } = require('@napi-rs/canvas');
 const { 
     parseDaysFilter, 
     getHourFromTimestamp,
@@ -1149,6 +1188,7 @@ const {
 const storage = require('./utils/storage');
 const db = require('./database');
 const { heatmapCache, aggregateCache } = require('./utils/cache');
+const config = require('./config');
 
 // ============================================
 // COLOR FUNCTIONS
@@ -1181,66 +1221,38 @@ function getTextColor(value, min, max) {
     return ratio > 0.3 ? '#000000' : '#FFFFFF';
 }
 
+function formatLastUpdated(timestampMs) {
+    if (!timestampMs) return 'Never';
+    
+    const now = Date.now();
+    const diffMs = now - timestampMs;
+    const diffMins = Math.floor(diffMs / 60000);
+    const diffHours = Math.floor(diffMs / 3600000);
+    const diffDays = Math.floor(diffMs / 86400000);
+    
+    if (diffMins < 1) return 'Just now';
+    if (diffMins < 60) return `${diffMins}m ago`;
+    if (diffHours < 24) return `${diffHours}h ago`;
+    if (diffDays < 7) return `${diffDays}d ago`;
+    
+    const date = new Date(timestampMs);
+    return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+}
+
 // ============================================
 // FAST AGGREGATION (using pre-computed data)
 // ============================================
 
-function aggregateFactionDataHourlyFast(factionId, dayFilter) {
-    const cacheKey = `faction:hourly:${factionId}:${dayFilter}`;
-    const cached = aggregateCache.get(cacheKey);
-    if (cached) return cached;
-    
-    const daysToShow = parseDaysFilter(dayFilter);
-    const aggregates = db.getHourlyAggregates(factionId, 30);
-    
-    // Build result structure
-    const result = {};
-    let globalMin = Infinity;
-    let globalMax = -Infinity;
-    
-    for (let hour = 0; hour < 24; hour++) {
-        result[hour] = {};
-        for (const day of daysToShow) {
-            result[hour][day] = 0;
-        }
-    }
-    
-    // Fill with aggregate data
-    for (const row of aggregates) {
-        if (!daysToShow.includes(row.day_of_week)) continue;
-        
-        const avg = row.total_snapshots > 0 
-            ? Math.round(row.total_active / row.total_snapshots * 10) / 10 
-            : 0;
-        
-        result[row.hour][row.day_of_week] = avg;
-        
-        if (avg < globalMin) globalMin = avg;
-        if (avg > globalMax) globalMax = avg;
-    }
-    
-    const output = { 
-        data: result, 
-        min: globalMin === Infinity ? 0 : globalMin, 
-        max: globalMax === -Infinity ? 0 : globalMax, 
-        days: daysToShow 
-    };
-    
-    aggregateCache.set(cacheKey, output);
-    return output;
-}
-
-function aggregateFactionData15MinFast(factionId, dayFilter) {
+function aggregateFactionData15MinFast(factionId, dayFilter, dataTimestamp) {
     const cacheKey = `faction:15min:${factionId}:${dayFilter}`;
-    const cached = aggregateCache.get(cacheKey);
+    const cached = aggregateCache.get(cacheKey, dataTimestamp);
     if (cached) return cached;
     
     const daysToShow = parseDaysFilter(dayFilter);
-    const aggregates = db.get15MinAggregates(factionId, 30);
+    const aggregates = db.get15MinAggregates(factionId, config.collection.dataRetentionDays);
     
     const result = {};
-    let globalMin = Infinity;
-    let globalMax = -Infinity;
+    let globalMax = 0;
     
     for (let hour = 0; hour < 24; hour++) {
         result[hour] = {};
@@ -1258,16 +1270,54 @@ function aggregateFactionData15MinFast(factionId, dayFilter) {
         
         result[row.hour][row.day_of_week][row.slot] = avg;
         
-        if (avg < globalMin) globalMin = avg;
         if (avg > globalMax) globalMax = avg;
     }
     
     const output = { 
         data: result, 
-        min: globalMin === Infinity ? 0 : globalMin, 
-        max: globalMax === -Infinity ? 0 : globalMax, 
+        min: 0, 
+        max: globalMax, 
         days: daysToShow,
         is15Min: true
+    };
+    
+    aggregateCache.set(cacheKey, output);
+    return output;
+}
+
+function aggregateFactionDataHourlyFast(factionId, dayFilter, dataTimestamp) {
+    const cacheKey = `faction:hourly:${factionId}:${dayFilter}`;
+    const cached = aggregateCache.get(cacheKey, dataTimestamp);
+    if (cached) return cached;
+    
+    const daysToShow = parseDaysFilter(dayFilter);
+    const aggregates = db.getHourlyAggregates(factionId, config.collection.dataRetentionDays);
+    
+    const result = {};
+    let globalMax = 0;
+    
+    for (let hour = 0; hour < 24; hour++) {
+        result[hour] = {};
+        for (const day of daysToShow) {
+            result[hour][day] = 0;
+        }
+    }
+    
+    for (const row of aggregates) {
+        if (!daysToShow.includes(row.day_of_week)) continue;
+        
+        const avg = row.avg_unique || 0;
+        
+        result[row.hour][row.day_of_week] = avg;
+        
+        if (avg > globalMax) globalMax = avg;
+    }
+    
+    const output = { 
+        data: result, 
+        min: 0, 
+        max: globalMax, 
+        days: daysToShow 
     };
     
     aggregateCache.set(cacheKey, output);
@@ -1278,9 +1328,9 @@ function aggregateFactionData15MinFast(factionId, dayFilter) {
 // USER AGGREGATION (needs raw snapshots)
 // ============================================
 
-function aggregateUserDataHourlyMultiFaction(userId, dayFilter) {
+function aggregateUserDataHourlyMultiFaction(userId, dayFilter, dataTimestamp) {
     const cacheKey = `user:hourly:${userId}:${dayFilter}`;
-    const cached = aggregateCache.get(cacheKey);
+    const cached = aggregateCache.get(cacheKey, dataTimestamp);
     if (cached) return cached;
     
     const daysToShow = parseDaysFilter(dayFilter);
@@ -1341,9 +1391,9 @@ function aggregateUserDataHourlyMultiFaction(userId, dayFilter) {
     return output;
 }
 
-function aggregateUserData15MinMultiFaction(userId, dayFilter) {
+function aggregateUserData15MinMultiFaction(userId, dayFilter, dataTimestamp) {
     const cacheKey = `user:15min:${userId}:${dayFilter}`;
-    const cached = aggregateCache.get(cacheKey);
+    const cached = aggregateCache.get(cacheKey, dataTimestamp);
     if (cached) return cached;
     
     const daysToShow = parseDaysFilter(dayFilter);
@@ -1420,7 +1470,7 @@ function aggregateUserData15MinMultiFaction(userId, dayFilter) {
 // IMAGE GENERATION
 // ============================================
 
-function generateHeatmapImage(title, aggregatedData, subtitle = '') {
+function generateHeatmapImage(title, aggregatedData, subtitle = '', lastUpdated = null) {
     const { data, min, max, days, isPercentage } = aggregatedData;
     
     const cellWidth = 55;
@@ -1429,10 +1479,11 @@ function generateHeatmapImage(title, aggregatedData, subtitle = '') {
     const headerHeight = 50;
     const titleHeight = subtitle ? 65 : 45;
     const legendHeight = 40;
+    const footerHeight = lastUpdated ? 25 : 0;
     const padding = 20;
     
     const width = labelWidth + (days.length * cellWidth) + padding * 2;
-    const height = titleHeight + headerHeight + (24 * cellHeight) + legendHeight + padding * 2;
+    const height = titleHeight + headerHeight + (24 * cellHeight) + legendHeight + footerHeight + padding * 2;
     
     const canvas = createCanvas(width, height);
     const ctx = canvas.getContext('2d');
@@ -1492,7 +1543,7 @@ function generateHeatmapImage(title, aggregatedData, subtitle = '') {
         });
     }
     
-    const legendY = height - legendHeight - padding + 10;
+    const legendY = padding + titleHeight + headerHeight + (24 * cellHeight) + 10;
     const legendWidth = 200;
     const legendX = (width - legendWidth) / 2;
     
@@ -1516,10 +1567,18 @@ function generateHeatmapImage(title, aggregatedData, subtitle = '') {
     ctx.fillText(minLabel, legendX, legendY + 28);
     ctx.fillText(maxLabel, legendX + legendWidth, legendY + 28);
     
+    // Last updated footer
+    if (lastUpdated) {
+        ctx.fillStyle = '#666666';
+        ctx.font = '10px Arial';
+        ctx.textAlign = 'right';
+        ctx.fillText(`Updated: ${formatLastUpdated(lastUpdated)}`, width - padding, height - padding + 5);
+    }
+    
     return canvas.toBuffer('image/png');
 }
 
-function generateCompact15MinImage(title, aggregatedData, subtitle = '') {
+function generateCompact15MinImage(title, aggregatedData, subtitle = '', lastUpdated = null) {
     const { data, min, max, days, isPercentage } = aggregatedData;
     
     const cellWidth = 75;
@@ -1528,10 +1587,11 @@ function generateCompact15MinImage(title, aggregatedData, subtitle = '') {
     const headerHeight = 50;
     const titleHeight = subtitle ? 65 : 45;
     const legendHeight = 50;
+    const footerHeight = lastUpdated ? 25 : 0;
     const padding = 20;
     
     const width = labelWidth + (days.length * cellWidth) + padding * 2;
-    const height = titleHeight + headerHeight + (24 * cellHeight) + legendHeight + padding * 2;
+    const height = titleHeight + headerHeight + (24 * cellHeight) + legendHeight + footerHeight + padding * 2;
     
     const canvas = createCanvas(width, height);
     const ctx = canvas.getContext('2d');
@@ -1591,7 +1651,7 @@ function generateCompact15MinImage(title, aggregatedData, subtitle = '') {
         });
     }
     
-    const legendY = height - legendHeight - padding + 10;
+    const legendY = padding + titleHeight + headerHeight + (24 * cellHeight) + 10;
     ctx.fillStyle = '#FFFFFF';
     ctx.font = '11px Arial';
     ctx.textAlign = 'center';
@@ -1621,10 +1681,18 @@ function generateCompact15MinImage(title, aggregatedData, subtitle = '') {
     ctx.fillText(minLabel, gradX, legendY + 35);
     ctx.fillText(maxLabel, gradX + gradWidth, legendY + 35);
     
+    // Last updated footer
+    if (lastUpdated) {
+        ctx.fillStyle = '#666666';
+        ctx.font = '10px Arial';
+        ctx.textAlign = 'right';
+        ctx.fillText(`Updated: ${formatLastUpdated(lastUpdated)}`, width - padding, height - padding + 5);
+    }
+    
     return canvas.toBuffer('image/png');
 }
 
-function generateComparisonImage(title1, data1, title2, data2) {
+function generateComparisonImage(title1, data1, title2, data2, lastUpdated1 = null, lastUpdated2 = null) {
     const days = data1.days;
     const is15Min = data1.is15Min;
     
@@ -1634,11 +1702,12 @@ function generateComparisonImage(title1, data1, title2, data2) {
     const headerHeight = 45;
     const titleHeight = 35;
     const gapWidth = 25;
+    const footerHeight = 25;
     const padding = 15;
     const sectionWidth = labelWidth + (days.length * cellWidth);
     
     const width = (sectionWidth * 2) + gapWidth + padding * 2;
-    const height = titleHeight + headerHeight + (24 * cellHeight) + padding * 2 + 30;
+    const height = titleHeight + headerHeight + (24 * cellHeight) + padding * 2 + 30 + footerHeight;
     
     const canvas = createCanvas(width, height);
     const ctx = canvas.getContext('2d');
@@ -1649,13 +1718,21 @@ function generateComparisonImage(title1, data1, title2, data2) {
     const globalMin = Math.min(data1.min, data2.min);
     const globalMax = Math.max(data1.max, data2.max);
     
-    function drawSection(data, title, offsetX) {
+    function drawSection(data, title, offsetX, lastUpdated) {
         ctx.fillStyle = '#FFFFFF';
         ctx.font = 'bold 13px Arial';
         ctx.textAlign = 'center';
         ctx.fillText(title, offsetX + sectionWidth / 2, padding + 20);
         
+        // Show last updated under title
+        if (lastUpdated) {
+            ctx.fillStyle = '#666666';
+            ctx.font = '9px Arial';
+            ctx.fillText(`(${formatLastUpdated(lastUpdated)})`, offsetX + sectionWidth / 2, padding + 32);
+        }
+        
         ctx.font = 'bold 10px Arial';
+        ctx.fillStyle = '#FFFFFF';
         days.forEach((day, i) => {
             const x = offsetX + labelWidth + (i * cellWidth) + cellWidth / 2;
             ctx.fillText(DAY_LABELS[day], x, padding + titleHeight + 22);
@@ -1710,13 +1787,13 @@ function generateComparisonImage(title1, data1, title2, data2) {
         }
     }
     
-    drawSection(data1, title1, padding);
-    drawSection(data2, title2, padding + sectionWidth + gapWidth);
+    drawSection(data1, title1, padding, lastUpdated1);
+    drawSection(data2, title2, padding + sectionWidth + gapWidth, lastUpdated2);
     
     return canvas.toBuffer('image/png');
 }
 
-function generateDifferenceImage(title1, data1, title2, data2) {
+function generateDifferenceImage(title1, data1, title2, data2, lastUpdated = null) {
     const days = data1.days;
     const is15Min = data1.is15Min;
     
@@ -1726,10 +1803,11 @@ function generateDifferenceImage(title1, data1, title2, data2) {
     const headerHeight = 50;
     const titleHeight = 45;
     const legendHeight = 50;
+    const footerHeight = lastUpdated ? 25 : 0;
     const padding = 20;
     
     const width = labelWidth + (days.length * cellWidth) + padding * 2;
-    const height = titleHeight + headerHeight + (24 * cellHeight) + legendHeight + padding * 2;
+    const height = titleHeight + headerHeight + (24 * cellHeight) + legendHeight + footerHeight + padding * 2;
     
     const canvas = createCanvas(width, height);
     const ctx = canvas.getContext('2d');
@@ -1831,22 +1909,32 @@ function generateDifferenceImage(title1, data1, title2, data2) {
         });
     }
     
-    const legendY = height - legendHeight - padding + 15;
+    const legendY = padding + titleHeight + headerHeight + (24 * cellHeight) + 15;
     ctx.fillStyle = '#FFFFFF';
     ctx.font = '12px Arial';
     ctx.textAlign = 'center';
     ctx.fillText(`Green = ${title1} higher | Red = ${title2} higher`, width / 2, legendY + 15);
     
+    // Last updated footer
+    if (lastUpdated) {
+        ctx.fillStyle = '#666666';
+        ctx.font = '10px Arial';
+        ctx.textAlign = 'right';
+        ctx.fillText(`Updated: ${formatLastUpdated(lastUpdated)}`, width - padding, height - padding + 5);
+    }
+    
     return canvas.toBuffer('image/png');
 }
 
 // ============================================
-// PUBLIC API (with caching)
+// PUBLIC API (with cache invalidation)
 // ============================================
 
 async function createFactionHeatmap(factionId, granularity, dayFilter) {
+    const lastUpdated = db.getFactionLastUpdated(factionId);
+    
     const cacheKey = `img:faction:${factionId}:${granularity}:${dayFilter}`;
-    const cached = heatmapCache.get(cacheKey);
+    const cached = heatmapCache.get(cacheKey, lastUpdated);
     if (cached) return cached;
     
     const faction = db.getFaction(factionId);
@@ -1857,15 +1945,15 @@ async function createFactionHeatmap(factionId, granularity, dayFilter) {
     
     const title = `${faction.name || 'Faction'} [${factionId}]`;
     const numWeeks = db.getWeekCount(factionId);
-    const subtitle = `Last 30 days (${numWeeks} week${numWeeks !== 1 ? 's' : ''} of data) - Avg active per hour`;
+    const subtitle = `Last ${config.collection.dataRetentionDays} days (${numWeeks} week${numWeeks !== 1 ? 's' : ''} of data) - Avg active per hour`;
     
     let buffer;
     if (granularity === '15min') {
-        const aggregated = aggregateFactionData15MinFast(factionId, dayFilter);
-        buffer = generateCompact15MinImage(title, aggregated, subtitle);
+        const aggregated = aggregateFactionData15MinFast(factionId, dayFilter, lastUpdated);
+        buffer = generateCompact15MinImage(title, aggregated, subtitle, lastUpdated);
     } else {
-        const aggregated = aggregateFactionDataHourlyFast(factionId, dayFilter);
-        buffer = generateHeatmapImage(title, aggregated, subtitle);
+        const aggregated = aggregateFactionDataHourlyFast(factionId, dayFilter, lastUpdated);
+        buffer = generateHeatmapImage(title, aggregated, subtitle, lastUpdated);
     }
     
     heatmapCache.set(cacheKey, buffer);
@@ -1873,16 +1961,18 @@ async function createFactionHeatmap(factionId, granularity, dayFilter) {
 }
 
 async function createUserHeatmap(userId, granularity, dayFilter) {
+    const lastUpdated = db.getUserLastUpdated(userId);
+    
     const cacheKey = `img:user:${userId}:${granularity}:${dayFilter}`;
-    const cached = heatmapCache.get(cacheKey);
+    const cached = heatmapCache.get(cacheKey, lastUpdated);
     if (cached) return cached;
     
     let aggregated;
     
     if (granularity === '15min') {
-        aggregated = aggregateUserData15MinMultiFaction(userId, dayFilter);
+        aggregated = aggregateUserData15MinMultiFaction(userId, dayFilter, lastUpdated);
     } else {
-        aggregated = aggregateUserDataHourlyMultiFaction(userId, dayFilter);
+        aggregated = aggregateUserDataHourlyMultiFaction(userId, dayFilter, lastUpdated);
     }
     
     if (!aggregated) {
@@ -1897,13 +1987,13 @@ async function createUserHeatmap(userId, granularity, dayFilter) {
     const factionInfo = aggregated.factionIds.length > 1 
         ? `across ${aggregated.factionIds.length} factions` 
         : '';
-    const subtitle = `Last 30 days (${numWeeks} week${numWeeks !== 1 ? 's' : ''}) - % active ${factionInfo}`;
+    const subtitle = `Last ${config.collection.dataRetentionDays} days (${numWeeks} week${numWeeks !== 1 ? 's' : ''}) - % active ${factionInfo}`;
     
     let buffer;
     if (granularity === '15min') {
-        buffer = generateCompact15MinImage(title, aggregated, subtitle);
+        buffer = generateCompact15MinImage(title, aggregated, subtitle, lastUpdated);
     } else {
-        buffer = generateHeatmapImage(title, aggregated, subtitle);
+        buffer = generateHeatmapImage(title, aggregated, subtitle, lastUpdated);
     }
     
     heatmapCache.set(cacheKey, buffer);
@@ -1911,8 +2001,12 @@ async function createUserHeatmap(userId, granularity, dayFilter) {
 }
 
 async function createComparisonHeatmaps(faction1Id, faction2Id, granularity, dayFilter) {
+    const lastUpdated1 = db.getFactionLastUpdated(faction1Id);
+    const lastUpdated2 = db.getFactionLastUpdated(faction2Id);
+    const latestUpdate = Math.max(lastUpdated1, lastUpdated2);
+    
     const cacheKey = `img:compare:${faction1Id}:${faction2Id}:${granularity}:${dayFilter}`;
-    const cached = heatmapCache.get(cacheKey);
+    const cached = heatmapCache.get(cacheKey, latestUpdate);
     if (cached) return cached;
     
     const faction1 = db.getFaction(faction1Id);
@@ -1927,15 +2021,15 @@ async function createComparisonHeatmaps(faction1Id, faction2Id, granularity, day
     let agg1, agg2;
     
     if (granularity === '15min') {
-        agg1 = aggregateFactionData15MinFast(faction1Id, dayFilter);
-        agg2 = aggregateFactionData15MinFast(faction2Id, dayFilter);
+        agg1 = aggregateFactionData15MinFast(faction1Id, dayFilter, lastUpdated1);
+        agg2 = aggregateFactionData15MinFast(faction2Id, dayFilter, lastUpdated2);
     } else {
-        agg1 = aggregateFactionDataHourlyFast(faction1Id, dayFilter);
-        agg2 = aggregateFactionDataHourlyFast(faction2Id, dayFilter);
+        agg1 = aggregateFactionDataHourlyFast(faction1Id, dayFilter, lastUpdated1);
+        agg2 = aggregateFactionDataHourlyFast(faction2Id, dayFilter, lastUpdated2);
     }
     
-    const sideBySide = generateComparisonImage(name1, agg1, name2, agg2);
-    const difference = generateDifferenceImage(name1, agg1, name2, agg2);
+    const sideBySide = generateComparisonImage(name1, agg1, name2, agg2, lastUpdated1, lastUpdated2);
+    const difference = generateDifferenceImage(name1, agg1, name2, agg2, latestUpdate);
     
     const result = { sideBySide, difference };
     heatmapCache.set(cacheKey, result);
@@ -1955,9 +2049,12 @@ File: src/index.js
 ----------------------------------------
 require('dotenv').config();
 
-const { Client, GatewayIntentBits, Collection, REST, Routes } = require('discord.js');
+const { Client, GatewayIntentBits, Collection, REST, Routes, ActivityType } = require('discord.js');
 const collector = require('./collector');
 const db = require('./database');
+const storage = require('./utils/storage');
+const config = require('./config');
+const { botLog } = require('./utils/logger');
 
 const activityCommand = require('./commands/activity');
 const exportCommand = require('./commands/export');
@@ -1970,6 +2067,26 @@ client.commands = new Collection();
 client.commands.set(activityCommand.data.name, activityCommand);
 client.commands.set(exportCommand.data.name, exportCommand);
 
+let presenceInterval = null;
+
+function updatePresence() {
+    try {
+        const stats = storage.getFactionStats();
+        const status = collector.getCollectorStatus();
+        
+        let activityText;
+        if (status.collecting) {
+            activityText = `Collecting data...`;
+        } else {
+            activityText = `${stats.configured} factions | ${stats.totalSnapshots} snapshots`;
+        }
+        
+        client.user.setActivity(activityText, { type: ActivityType.Watching });
+    } catch (error) {
+        botLog.error({ error: error.message }, 'Failed to update presence');
+    }
+}
+
 async function registerCommands() {
     const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
     
@@ -1979,21 +2096,21 @@ async function registerCommands() {
     ];
     
     try {
-        console.log('Registering slash commands...');
+        botLog.info('Registering slash commands...');
         
         await rest.put(
             Routes.applicationCommands(process.env.DISCORD_CLIENT_ID),
             { body: commands }
         );
         
-        console.log('Slash commands registered successfully.');
+        botLog.info('Slash commands registered successfully');
     } catch (error) {
-        console.error('Error registering commands:', error);
+        botLog.error({ error: error.message }, 'Error registering commands');
     }
 }
 
 client.once('ready', async () => {
-    console.log(`Logged in as ${client.user.tag}`);
+    botLog.info({ tag: client.user.tag }, 'Bot logged in');
     
     // Initialize database
     db.getDb();
@@ -2001,6 +2118,12 @@ client.once('ready', async () => {
     await registerCommands();
     
     collector.startCollector();
+    
+    // Set initial presence
+    updatePresence();
+    
+    // Update presence periodically
+    presenceInterval = setInterval(updatePresence, config.presence.updateIntervalMs);
 });
 
 client.on('interactionCreate', async interaction => {
@@ -2012,7 +2135,7 @@ client.on('interactionCreate', async interaction => {
         try {
             await command.autocomplete(interaction);
         } catch (error) {
-            console.error('Autocomplete error:', error);
+            botLog.error({ error: error.message }, 'Autocomplete error');
         }
         return;
     }
@@ -2026,7 +2149,11 @@ client.on('interactionCreate', async interaction => {
     try {
         await command.execute(interaction);
     } catch (error) {
-        console.error('Command execution error:', error);
+        botLog.error({ 
+            error: error.message, 
+            command: interaction.commandName,
+            user: interaction.user.tag 
+        }, 'Command execution error');
         
         const errorMessage = { 
             content: '❌ An error occurred while executing this command.', 
@@ -2041,37 +2168,36 @@ client.on('interactionCreate', async interaction => {
     }
 });
 
-process.on('SIGINT', () => {
-    console.log('Shutting down...');
+function shutdown() {
+    botLog.info('Shutting down...');
+    
+    if (presenceInterval) {
+        clearInterval(presenceInterval);
+    }
+    
     collector.stopCollector();
     db.closeDb();
     client.destroy();
     process.exit(0);
-});
+}
 
-process.on('SIGTERM', () => {
-    console.log('Shutting down...');
-    collector.stopCollector();
-    db.closeDb();
-    client.destroy();
-    process.exit(0);
-});
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);
 
 client.login(process.env.DISCORD_TOKEN);
+
 
 ================================================================================
 
 File: src/utils/api.js
 ----------------------------------------
+
+
 const storage = require('./storage');
+const config = require('../config');
+const { apiLog } = require('./logger');
 
 const API_BASE = 'https://api.torn.com';
-const MAX_RETRIES = 3;
-const RETRY_DELAY = 1000;
-
-// Rate limiting: 20 calls per minute per key
-const RATE_LIMIT_PER_KEY = 20;
-const RATE_LIMIT_WINDOW = 60 * 1000;
 
 const apiCallLog = new Map();
 
@@ -2082,7 +2208,7 @@ async function sleep(ms) {
 function cleanOldCalls(key) {
     const now = Date.now();
     const calls = apiCallLog.get(key) || [];
-    const recentCalls = calls.filter(t => now - t < RATE_LIMIT_WINDOW);
+    const recentCalls = calls.filter(t => now - t < config.api.rateLimitWindowMs);
     apiCallLog.set(key, recentCalls);
     return recentCalls;
 }
@@ -2099,52 +2225,50 @@ function logCall(key) {
 
 function getTimeUntilSlotAvailable(key) {
     const calls = cleanOldCalls(key);
-    if (calls.length < RATE_LIMIT_PER_KEY) {
+    if (calls.length < config.api.callsPerKeyPerMinute) {
         return 0;
     }
     const oldestCall = Math.min(...calls);
-    const timeUntilExpiry = (oldestCall + RATE_LIMIT_WINDOW) - Date.now();
+    const timeUntilExpiry = (oldestCall + config.api.rateLimitWindowMs) - Date.now();
     return Math.max(0, timeUntilExpiry + 100);
 }
 
 function findAvailableKey(excludeKeys = []) {
-    const config = storage.loadConfig();
+    const storageConfig = storage.loadConfig();
     
-    if (config.apikeys.length === 0) {
+    if (storageConfig.apikeys.length === 0) {
         return { key: null, waitTime: 0 };
     }
     
     const now = Date.now();
-    config.failedKeys = config.failedKeys || {};
+    storageConfig.failedKeys = storageConfig.failedKeys || {};
     
     // Clean up old failures
     let changed = false;
-    for (const key of Object.keys(config.failedKeys)) {
-        if (now - config.failedKeys[key] > 5 * 60 * 1000) {
-            delete config.failedKeys[key];
+    for (const key of Object.keys(storageConfig.failedKeys)) {
+        if (now - storageConfig.failedKeys[key] > config.api.failedKeyTimeoutMs) {
+            delete storageConfig.failedKeys[key];
             changed = true;
         }
     }
     if (changed) {
-        storage.saveConfig(config);
+        storage.saveConfig(storageConfig);
     }
     
-    // Find available keys
-    const availableKeys = config.apikeys.filter(k => 
-        !excludeKeys.includes(k) && !config.failedKeys[k]
+    const availableKeys = storageConfig.apikeys.filter(k => 
+        !excludeKeys.includes(k) && !storageConfig.failedKeys[k]
     );
     
     if (availableKeys.length === 0) {
-        if (Object.keys(config.failedKeys).length > 0) {
-            config.failedKeys = {};
-            storage.saveConfig(config);
-            const key = config.apikeys.find(k => !excludeKeys.includes(k));
+        if (Object.keys(storageConfig.failedKeys).length > 0) {
+            storageConfig.failedKeys = {};
+            storage.saveConfig(storageConfig);
+            const key = storageConfig.apikeys.find(k => !excludeKeys.includes(k));
             return { key: key || null, waitTime: 0 };
         }
         return { key: null, waitTime: 0 };
     }
     
-    // Find key with most capacity (lowest usage)
     let bestKey = null;
     let lowestWait = Infinity;
     let lowestUsage = Infinity;
@@ -2153,19 +2277,16 @@ function findAvailableKey(excludeKeys = []) {
         const usage = getCallCount(key);
         const waitTime = getTimeUntilSlotAvailable(key);
         
-        // Prefer keys that don't need waiting
         if (waitTime === 0 && usage < lowestUsage) {
             lowestUsage = usage;
             bestKey = key;
             lowestWait = 0;
         } else if (lowestWait > 0 && waitTime < lowestWait) {
-            // If all keys need waiting, pick the one with shortest wait
             lowestWait = waitTime;
             bestKey = key;
         }
     }
     
-    // If no key found without wait, use the one with shortest wait
     if (!bestKey && availableKeys.length > 0) {
         bestKey = availableKeys[0];
         lowestWait = getTimeUntilSlotAvailable(bestKey);
@@ -2181,11 +2302,13 @@ async function fetchWithRetry(url, context = '', usedKeys = [], attempt = 1) {
         throw new Error('No API keys available. All keys may have failed.');
     }
     
-    // Wait if needed
     if (waitTime > 0) {
         const keyHint = apiKey.slice(-4);
-        const waitSec = Math.ceil(waitTime / 1000);
-        console.log(`[API] Waiting ${waitSec}s for rate limit (key ...${keyHint})${context ? ` - ${context}` : ''}`);
+        apiLog.debug({ 
+            waitMs: waitTime, 
+            key: `...${keyHint}`, 
+            context 
+        }, 'Waiting for rate limit');
         await sleep(waitTime);
     }
     
@@ -2208,11 +2331,11 @@ async function fetchWithRetry(url, context = '', usedKeys = [], attempt = 1) {
             const errorMsg = data.error.error;
             
             if ([1, 2, 10, 13].includes(errorCode)) {
-                console.error(`[API] Key error (${errorCode}): ${errorMsg}. Trying next key...`);
+                apiLog.warn({ errorCode, errorMsg }, 'Key error, trying next key');
                 storage.markKeyFailed(apiKey);
                 
-                if (attempt < MAX_RETRIES && usedKeys.length + 1 < storage.loadConfig().apikeys.length) {
-                    await sleep(RETRY_DELAY);
+                if (attempt < config.api.retryAttempts && usedKeys.length + 1 < storage.loadConfig().apikeys.length) {
+                    await sleep(config.api.retryDelayMs);
                     return fetchWithRetry(url, context, [...usedKeys, apiKey], attempt + 1);
                 }
                 
@@ -2220,7 +2343,7 @@ async function fetchWithRetry(url, context = '', usedKeys = [], attempt = 1) {
             }
             
             if (errorCode === 5) {
-                console.log('[API] Torn rate limit hit. Waiting 30 seconds...');
+                apiLog.warn('Torn rate limit hit, waiting 30 seconds');
                 await sleep(30000);
                 return fetchWithRetry(url, context, usedKeys, attempt);
             }
@@ -2242,11 +2365,11 @@ async function fetchWithRetry(url, context = '', usedKeys = [], attempt = 1) {
             error.message.includes('ECONNREFUSED') ||
             error.message.includes('ENOTFOUND')) {
             
-            console.error(`[API] Network error: ${error.message}. Trying next key...`);
+            apiLog.error({ error: error.message }, 'Network error, trying next key');
             storage.markKeyFailed(apiKey);
             
-            if (attempt < MAX_RETRIES) {
-                await sleep(RETRY_DELAY);
+            if (attempt < config.api.retryAttempts) {
+                await sleep(config.api.retryDelayMs);
                 return fetchWithRetry(url, context, [...usedKeys, apiKey], attempt + 1);
             }
         }
@@ -2290,12 +2413,11 @@ async function fetchAllHOF(progressCallback = null) {
                 hasMore = false;
             }
             
-            if (allFactions.length >= 5000) {
+            if (allFactions.length >= config.hof.maxFactions) {
                 hasMore = false;
             }
             
-            // Delay between pages
-            await sleep(500);
+            await sleep(config.hof.pageFetchDelayMs);
         }
     }
     
@@ -2307,14 +2429,18 @@ function processActivitySnapshot(factionData, pollTimestamp) {
     const allMemberIds = [];
     const members = factionData.members || {};
     
+    // Calculate the start of the current 15-min slot
+    const slotDurationSeconds = 15 * 60;
+    const slotStart = Math.floor(pollTimestamp / slotDurationSeconds) * slotDurationSeconds;
+    
     for (const [memberId, memberData] of Object.entries(members)) {
         const id = parseInt(memberId);
         allMemberIds.push(id);
         
         const lastAction = memberData.last_action?.timestamp || 0;
-        const timeDiff = pollTimestamp - lastAction;
         
-        if (timeDiff <= 900) {
+        // Active if their last action is within the current 15-min slot
+        if (lastAction >= slotStart) {
             activeMembers.push(id);
         }
     }
@@ -2328,18 +2454,18 @@ function processActivitySnapshot(factionData, pollTimestamp) {
 }
 
 function getRateLimitStatus() {
-    const config = storage.loadConfig();
+    const storageConfig = storage.loadConfig();
     const status = {};
     
-    for (const key of config.apikeys) {
+    for (const key of storageConfig.apikeys) {
         const masked = `...${key.slice(-4)}`;
         const calls = getCallCount(key);
-        const isFailed = config.failedKeys && config.failedKeys[key];
+        const isFailed = storageConfig.failedKeys && storageConfig.failedKeys[key];
         
         status[masked] = {
             calls,
-            limit: RATE_LIMIT_PER_KEY,
-            available: RATE_LIMIT_PER_KEY - calls,
+            limit: config.api.callsPerKeyPerMinute,
+            available: config.api.callsPerKeyPerMinute - calls,
             failed: !!isFailed
         };
     }
@@ -2348,21 +2474,20 @@ function getRateLimitStatus() {
 }
 
 function estimateCollectionTime(factionCount) {
-    const config = storage.loadConfig();
-    const keyCount = config.apikeys.length;
+    const storageConfig = storage.loadConfig();
+    const keyCount = storageConfig.apikeys.length;
     
     if (keyCount === 0) return Infinity;
     
-    const totalCallsPerMinute = keyCount * RATE_LIMIT_PER_KEY;
+    const totalCallsPerMinute = keyCount * config.api.callsPerKeyPerMinute;
     const minutes = factionCount / totalCallsPerMinute;
     
     return Math.ceil(minutes * 60);
 }
 
-// Clear rate limit tracking (useful for debugging)
 function clearRateLimitLog() {
     apiCallLog.clear();
-    console.log('[API] Rate limit log cleared');
+    apiLog.info('Rate limit log cleared');
 }
 
 module.exports = {
@@ -2373,13 +2498,16 @@ module.exports = {
     getRateLimitStatus,
     estimateCollectionTime,
     clearRateLimitLog,
-    RATE_LIMIT_PER_KEY
+    RATE_LIMIT_PER_KEY: config.api.callsPerKeyPerMinute
 };
 
 ================================================================================
 
 File: src/utils/helpers.js
 ----------------------------------------
+
+const config = require('../config');
+
 const DAY_NAMES = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'];
 const DAY_LABELS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 
@@ -2435,19 +2563,21 @@ function formatTimeSlot(index, granularity) {
 }
 
 function getThirtyDaysAgo() {
-    return Math.floor(Date.now() / 1000) - (30 * 24 * 60 * 60);
+    return Math.floor(Date.now() / 1000) - (config.collection.dataRetentionDays * 24 * 60 * 60);
+}
+
+function getDaysAgo(days) {
+    return Math.floor(Date.now() / 1000) - (days * 24 * 60 * 60);
 }
 
 function getWeekId(timestamp, referenceTimestamp) {
     const refDate = new Date(referenceTimestamp * 1000);
     const targetDate = new Date(timestamp * 1000);
     
-    // Get start of week (Sunday) for reference
     const refWeekStart = new Date(refDate);
     refWeekStart.setUTCHours(0, 0, 0, 0);
     refWeekStart.setUTCDate(refWeekStart.getUTCDate() - refWeekStart.getUTCDay());
     
-    // Get start of week for target
     const targetWeekStart = new Date(targetDate);
     targetWeekStart.setUTCHours(0, 0, 0, 0);
     targetWeekStart.setUTCDate(targetWeekStart.getUTCDate() - targetWeekStart.getUTCDay());
@@ -2467,6 +2597,64 @@ function getUniqueWeeks(snapshots, referenceTimestamp) {
     return weeks.size;
 }
 
+/**
+ * Resolve multiple factions from comma-separated input
+ * @param {string} input - Comma-separated faction names or IDs
+ * @param {object} hof - HOF module reference
+ * @param {object} storage - Storage module reference
+ * @returns {Array<{id: number, name: string, members: number|null}>}
+ */
+function resolveMultipleFactions(input, hof, storage) {
+    const parts = input.split(',').map(p => p.trim()).filter(p => p.length > 0);
+    const resolved = [];
+    const seen = new Set();
+    
+    for (const part of parts) {
+        // Try as ID first
+        const asNumber = parseInt(part);
+        if (!isNaN(asNumber) && asNumber.toString() === part) {
+            if (!seen.has(asNumber)) {
+                const hofData = hof.getFactionFromHOF(asNumber);
+                const storageData = storage.loadFactionData(asNumber);
+                
+                resolved.push({
+                    id: asNumber,
+                    name: hofData?.name || storageData?.name || `Faction ${asNumber}`,
+                    members: hofData?.members || null
+                });
+                seen.add(asNumber);
+            }
+            continue;
+        }
+        
+        // Try as name
+        const hofResults = hof.searchHOFByName(part);
+        const trackedResults = storage.searchFactionByName(part);
+        
+        let found = hofResults.find(f => f.name.toLowerCase() === part.toLowerCase());
+        if (!found) {
+            found = trackedResults.find(f => f.name.toLowerCase() === part.toLowerCase());
+        }
+        if (!found && hofResults.length > 0) {
+            found = hofResults[0];
+        }
+        if (!found && trackedResults.length > 0) {
+            found = trackedResults[0];
+        }
+        
+        if (found && !seen.has(found.id)) {
+            resolved.push({
+                id: found.id,
+                name: found.name,
+                members: found.members || null
+            });
+            seen.add(found.id);
+        }
+    }
+    
+    return resolved;
+}
+
 module.exports = {
     DAY_NAMES,
     DAY_LABELS,
@@ -2476,8 +2664,10 @@ module.exports = {
     getDayOfWeek,
     formatTimeSlot,
     getThirtyDaysAgo,
+    getDaysAgo,
     getWeekId,
-    getUniqueWeeks
+    getUniqueWeeks,
+    resolveMultipleFactions
 };
 
 ================================================================================
@@ -2488,6 +2678,9 @@ const fs = require('fs');
 const path = require('path');
 const db = require('../database');
 const { memberCache } = require('./cache');
+const { encrypt, decrypt } = require('./crypto');
+const { getThirtyDaysAgo } = require('./helpers');
+const { dbLog } = require('./logger');
 
 const CONFIG_PATH = path.join(__dirname, '../../config.json');
 const DATA_DIR = path.join(__dirname, '../../data');
@@ -2514,7 +2707,14 @@ function loadConfig() {
         }
         
         const data = fs.readFileSync(CONFIG_PATH, 'utf8');
-        configCache = JSON.parse(data);
+        const config = JSON.parse(data);
+        
+        // Decrypt API keys on load
+        if (config.apikeys) {
+            config.apikeys = config.apikeys.map(key => decrypt(key));
+        }
+        
+        configCache = config;
         configMtime = stats.mtimeMs;
         return configCache;
     } catch (error) {
@@ -2523,9 +2723,15 @@ function loadConfig() {
 }
 
 function saveConfig(config) {
-    configCache = config;
+    // Create a copy with encrypted API keys for saving
+    const configToSave = {
+        ...config,
+        apikeys: config.apikeys.map(key => encrypt(key))
+    };
+    
+    configCache = config; // Keep decrypted version in cache
     configMtime = Date.now();
-    fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2));
+    fs.writeFileSync(CONFIG_PATH, JSON.stringify(configToSave, null, 2));
 }
 
 // ============================================
@@ -2567,15 +2773,14 @@ function addSnapshot(factionId, factionName, timestamp, activeMembers, totalMemb
     
     // Prune old data periodically (1% chance per snapshot)
     if (Math.random() < 0.01) {
-        const pruned = db.pruneOldData(30);
+        const pruned = db.pruneOldData();
         if (pruned > 0) {
-            console.log(`[DB] Pruned ${pruned} old snapshots`);
+            dbLog.info({ pruned }, 'Pruned old snapshots');
         }
     }
 }
 
 function getSnapshotsNormalized(factionData) {
-    // If it's already normalized from DB, return as-is
     if (Array.isArray(factionData.snapshots)) {
         return factionData.snapshots;
     }
@@ -2599,7 +2804,6 @@ function updateMemberNames(members) {
 }
 
 function getMemberName(userId) {
-    // Check cache first
     const cached = memberCache.get(`name:${userId}`);
     if (cached) return cached;
     
@@ -2885,14 +3089,6 @@ function getAllTrackedFactionIds() {
     return loadConfig().factions;
 }
 
-// ============================================
-// HELPERS
-// ============================================
-
-function getThirtyDaysAgo() {
-    return Math.floor(Date.now() / 1000) - (30 * 24 * 60 * 60);
-}
-
 module.exports = {
     loadConfig,
     saveConfig,
@@ -2930,12 +3126,207 @@ File: config.json
 {
   "factions": [
     47878,
-    8677
+    8677,
+    9674,
+    9405,
+    9110,
+    8205,
+    7986,
+    7251,
+    7115,
+    5431,
+    51926,
+    51758,
+    50844,
+    50737,
+    50457,
+    49953,
+    49927,
+    49430,
+    49297,
+    48277,
+    47710,
+    47314,
+    45421,
+    45415,
+    44164,
+    37838,
+    36274,
+    35776,
+    30584,
+    25288,
+    24106,
+    23952,
+    20881,
+    20303,
+    18560,
+    16443,
+    16247,
+    15644,
+    15222,
+    15083,
+    13138,
+    11782,
+    1117,
+    10820,
+    10184,
+    8803,
+    8606,
+    8384,
+    7935,
+    7652,
+    7093,
+    53808,
+    53428,
+    51357,
+    51164,
+    50579,
+    50344,
+    49994,
+    49916,
+    49903,
+    48680,
+    48179,
+    46127,
+    45837,
+    45046,
+    44762,
+    44746,
+    44404,
+    43699,
+    43545,
+    43428,
+    41309,
+    40334,
+    38847,
+    38662,
+    38634,
+    37803,
+    37426,
+    37132,
+    33999,
+    30085,
+    28460,
+    24218,
+    20718,
+    18963,
+    18090,
+    17587,
+    17055,
+    16696,
+    15930,
+    15595,
+    15256,
+    14386,
+    13737,
+    13726,
+    13343,
+    10979,
+    9455,
+    8944,
+    7002,
+    53697,
+    53389,
+    53023,
+    52905,
+    52870,
+    52793,
+    52783,
+    52777,
+    51697,
+    51384,
+    51282,
+    50791,
+    50743,
+    50502,
+    50245,
+    50150,
+    49776,
+    49666,
+    49617,
+    49319,
+    49164,
+    49028,
+    48848,
+    48769,
+    48754,
+    48718,
+    48526,
+    48461,
+    48093,
+    48040,
+    47042,
+    46700,
+    46692,
+    46022,
+    44625,
+    44376,
+    44092,
+    43836,
+    42872,
+    42685,
+    42671,
+    42263,
+    41803,
+    41225,
+    41123,
+    41066,
+    39781,
+    38319,
+    38097,
+    35140,
+    27211,
+    22932,
+    21234,
+    21040,
+    20554,
+    19060,
+    15226,
+    13307,
+    10940,
+    10296,
+    8103,
+    7171,
+    7074,
+    53947,
+    52327,
+    51803,
+    51062,
+    50450,
+    49636,
+    49561,
+    49196,
+    48835,
+    48689,
+    48443,
+    48025,
+    47760,
+    47100,
+    44040,
+    42961,
+    42741,
+    42435,
+    41291,
+    41234,
+    40399,
+    40380,
+    37498,
+    36457,
+    34247,
+    29107,
+    19449,
+    18420,
+    14438,
+    14432,
+    11559,
+    11356,
+    11162
   ],
   "apikeys": [
     "r8ixcUfQoiLgx7Uo"
   ],
-  "currentKeyIndex": 0
+  "currentKeyIndex": 0,
+  "failedKeys": {}
 }
 
 ================================================================================
@@ -2943,9 +3334,19 @@ File: config.json
 File: src/export/generator.js
 ----------------------------------------
 const storage = require('../utils/storage');
-const helpers = require('../utils/helpers');
+const { 
+    getThirtyDaysAgo, 
+    getDaysAgo,
+    getDayOfWeek, 
+    getHourFromTimestamp, 
+    get15MinSlotInHour, 
+    getWeekId,
+    getUniqueWeeks 
+} = require('../utils/helpers');
 
 const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+
+
 
 // ============================================
 // DATA AGGREGATION (same logic as web routes)
@@ -2953,7 +3354,7 @@ const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 
 function aggregateHeatmapData(snapshots, granularity) {
     const now = Math.floor(Date.now() / 1000);
-    const thirtyDaysAgo = helpers.getThirtyDaysAgo();
+    const thirtyDaysAgo = getThirtyDaysAgo();
     
     if (granularity === '15min') {
         const data = {};
@@ -2972,10 +3373,10 @@ function aggregateHeatmapData(snapshots, granularity) {
         for (const snapshot of snapshots) {
             if (snapshot.timestamp < thirtyDaysAgo) continue;
             
-            const day = helpers.getDayOfWeek(snapshot.timestamp);
-            const hour = helpers.getHourFromTimestamp(snapshot.timestamp);
-            const slot = helpers.get15MinSlotInHour(snapshot.timestamp);
-            const weekId = helpers.getWeekId(snapshot.timestamp, now);
+            const day = getDayOfWeek(snapshot.timestamp);
+            const hour = getHourFromTimestamp(snapshot.timestamp);
+            const slot = get15MinSlotInHour(snapshot.timestamp);
+            const weekId = getWeekId(snapshot.timestamp, now);
             
             if (!data[hour][day][slot].weeklyUnique[weekId]) {
                 data[hour][day][slot].weeklyUnique[weekId] = new Set();
@@ -3028,9 +3429,9 @@ function aggregateHeatmapData(snapshots, granularity) {
         for (const snapshot of snapshots) {
             if (snapshot.timestamp < thirtyDaysAgo) continue;
             
-            const day = helpers.getDayOfWeek(snapshot.timestamp);
-            const hour = helpers.getHourFromTimestamp(snapshot.timestamp);
-            const weekId = helpers.getWeekId(snapshot.timestamp, now);
+            const day = getDayOfWeek(snapshot.timestamp);
+            const hour = getHourFromTimestamp(snapshot.timestamp);
+            const weekId = getWeekId(snapshot.timestamp, now);
             
             if (!data[hour][day][weekId]) {
                 data[hour][day][weekId] = new Set();
@@ -3071,7 +3472,7 @@ function aggregateHeatmapData(snapshots, granularity) {
 }
 
 function aggregateMemberHeatmapData(snapshots, memberId, granularity) {
-    const thirtyDaysAgo = helpers.getThirtyDaysAgo();
+    const thirtyDaysAgo = getThirtyDaysAgo();
     const now = Math.floor(Date.now() / 1000);
     
     if (granularity === '15min') {
@@ -3097,9 +3498,9 @@ function aggregateMemberHeatmapData(snapshots, memberId, granularity) {
             if (processed.has(key)) continue;
             processed.add(key);
             
-            const day = helpers.getDayOfWeek(snapshot.timestamp);
-            const hour = helpers.getHourFromTimestamp(snapshot.timestamp);
-            const slot = helpers.get15MinSlotInHour(snapshot.timestamp);
+            const day = getDayOfWeek(snapshot.timestamp);
+            const hour = getHourFromTimestamp(snapshot.timestamp);
+            const slot = get15MinSlotInHour(snapshot.timestamp);
             
             data[hour][day][slot].total++;
             if (snapshot.active.includes(memberId)) {
@@ -3134,9 +3535,9 @@ function aggregateMemberHeatmapData(snapshots, memberId, granularity) {
         for (const snapshot of snapshots) {
             if (snapshot.timestamp < thirtyDaysAgo) continue;
             
-            const day = helpers.getDayOfWeek(snapshot.timestamp);
-            const hour = helpers.getHourFromTimestamp(snapshot.timestamp);
-            const weekId = `${snapshot.factionId || 0}-${helpers.getWeekId(snapshot.timestamp, now)}`;
+            const day = getDayOfWeek(snapshot.timestamp);
+            const hour = getHourFromTimestamp(snapshot.timestamp);
+            const weekId = `${snapshot.factionId || 0}-${getWeekId(snapshot.timestamp, now)}`;
             
             data[hour][day].weeksWithData.add(weekId);
             if (snapshot.active.includes(memberId)) {
@@ -3160,7 +3561,7 @@ function aggregateMemberHeatmapData(snapshots, memberId, granularity) {
 }
 
 function calculateMemberStats(snapshots, memberId) {
-    const thirtyDaysAgo = helpers.getThirtyDaysAgo();
+    const thirtyDaysAgo = getThirtyDaysAgo();
     const sevenDaysAgo = Math.floor(Date.now() / 1000) - (7 * 24 * 60 * 60);
     
     let total30d = 0, active30d = 0;
@@ -3847,7 +4248,7 @@ async function generateFactionHTML(factionId) {
     }
     
     const latest = snapshots[snapshots.length - 1];
-    const numWeeks = helpers.getUniqueWeeks(snapshots, Math.floor(Date.now() / 1000));
+    const numWeeks = getUniqueWeeks(snapshots, Math.floor(Date.now() / 1000));
     
     // Get heatmap data
     const heatmap = aggregateHeatmapData(snapshots, 'hourly');
@@ -3987,7 +4388,7 @@ async function generateMemberHTML(memberId) {
     const heatmap15Min = aggregateMemberHeatmapData(allSnapshots, memberId, '15min');
     const stats = calculateMemberStats(allSnapshots, memberId);
     
-    const numWeeks = helpers.getUniqueWeeks(allSnapshots, Math.floor(Date.now() / 1000));
+    const numWeeks = getUniqueWeeks(allSnapshots, Math.floor(Date.now() / 1000));
     
     const data = {
         heatmap,
@@ -4054,6 +4455,7 @@ File: src/commands/export.js
 const { SlashCommandBuilder, AttachmentBuilder } = require('discord.js');
 const { generateFactionHTML, generateMemberHTML } = require('../export/generator');
 const storage = require('../utils/storage');
+const { cmdLog } = require('../utils/logger');
 
 module.exports = {
     data: new SlashCommandBuilder()
@@ -4100,7 +4502,6 @@ module.exports = {
                 }));
             }
         } else {
-            // faction
             if (value.length === 0) {
                 choices = storage.getAllFactionChoices();
             } else {
@@ -4132,6 +4533,7 @@ module.exports = {
                     });
                 }
                 
+                cmdLog.info({ factionId: faction.id, name: faction.name }, 'Exporting faction');
                 html = await generateFactionHTML(faction.id);
                 filename = `${sanitizeFilename(faction.name)}_activity.html`;
                 
@@ -4145,6 +4547,7 @@ module.exports = {
                     });
                 }
                 
+                cmdLog.info({ memberId: member.id, name: member.name }, 'Exporting member');
                 html = await generateMemberHTML(member.id);
                 filename = `${sanitizeFilename(member.name)}_activity.html`;
             }
@@ -4158,7 +4561,7 @@ module.exports = {
             });
             
         } catch (error) {
-            console.error('Export error:', error);
+            cmdLog.error({ error: error.message }, 'Export error');
             await interaction.editReply({
                 content: `❌ Error: ${error.message}`
             });
@@ -4177,18 +4580,19 @@ function sanitizeFilename(name) {
 
 File: src/utils/cache.js
 ----------------------------------------
+const config = require('../config');
+
 class Cache {
     constructor(options = {}) {
         this.cache = new Map();
-        this.ttl = options.ttl || 5 * 60 * 1000; // 5 minutes default
+        this.ttl = options.ttl || 5 * 60 * 1000;
         this.maxSize = options.maxSize || 100;
-        this.cleanupInterval = options.cleanupInterval || 60 * 1000; // 1 minute
+        this.cleanupInterval = options.cleanupInterval || 60 * 1000;
         
-        // Start cleanup timer
         this.cleanupTimer = setInterval(() => this.cleanup(), this.cleanupInterval);
     }
     
-    get(key) {
+    get(key, invalidateIfOlderThan = null) {
         const item = this.cache.get(key);
         
         if (!item) return null;
@@ -4198,13 +4602,17 @@ class Cache {
             return null;
         }
         
-        // Update access time for LRU
+        // Invalidate if data has been updated since cache was created
+        if (invalidateIfOlderThan !== null && item.createdAt < invalidateIfOlderThan) {
+            this.cache.delete(key);
+            return null;
+        }
+        
         item.lastAccess = Date.now();
         return item.value;
     }
     
     set(key, value, ttl = this.ttl) {
-        // Evict if at max size
         if (this.cache.size >= this.maxSize) {
             this.evictLRU();
         }
@@ -4212,12 +4620,13 @@ class Cache {
         this.cache.set(key, {
             value,
             expires: Date.now() + ttl,
+            createdAt: Date.now(),
             lastAccess: Date.now()
         });
     }
     
-    has(key) {
-        return this.get(key) !== null;
+    has(key, invalidateIfOlderThan = null) {
+        return this.get(key, invalidateIfOlderThan) !== null;
     }
     
     delete(key) {
@@ -4266,10 +4675,21 @@ class Cache {
     }
 }
 
-// Pre-configured caches
-const heatmapCache = new Cache({ ttl: 5 * 60 * 1000, maxSize: 200 }); // 5 min
-const aggregateCache = new Cache({ ttl: 15 * 60 * 1000, maxSize: 500 }); // 15 min
-const memberCache = new Cache({ ttl: 60 * 60 * 1000, maxSize: 1000 }); // 1 hour
+// Pre-configured caches using config
+const heatmapCache = new Cache({ 
+    ttl: config.cache.heatmapTtlMs, 
+    maxSize: config.cache.heatmapMaxSize 
+});
+
+const aggregateCache = new Cache({ 
+    ttl: config.cache.aggregateTtlMs, 
+    maxSize: config.cache.aggregateMaxSize 
+});
+
+const memberCache = new Cache({ 
+    ttl: config.cache.memberTtlMs, 
+    maxSize: config.cache.memberMaxSize 
+});
 
 module.exports = {
     Cache,
@@ -4282,18 +4702,17 @@ module.exports = {
 
 File: src/utils/hof.js
 ----------------------------------------
+
 const fs = require('fs');
 const path = require('path');
 const api = require('./api');
+const config = require('../config');
+const { hofLog } = require('./logger');
 
 const DATA_DIR = path.join(__dirname, '../../data');
 const HOF_CACHE_PATH = path.join(DATA_DIR, 'hof_cache.json');
 
-// Update HOF cache every 7 days
-const HOF_UPDATE_INTERVAL = 7 * 24 * 60 * 60 * 1000;
-
-// Only track these ranks
-const TRACKED_RANKS = ['diamond', 'platinum'];
+const TRACKED_RANKS = config.hof.trackedRanks;
 
 function ensureDataDir() {
     if (!fs.existsSync(DATA_DIR)) {
@@ -4323,7 +4742,7 @@ function saveHOFCache(cache) {
 function isHOFCacheStale() {
     const cache = loadHOFCache();
     const now = Date.now();
-    return (now - cache.lastUpdated) > HOF_UPDATE_INTERVAL;
+    return (now - cache.lastUpdated) > config.hof.updateIntervalMs;
 }
 
 function isTrackedRank(rank) {
@@ -4335,13 +4754,12 @@ function isTrackedRank(rank) {
 function isBelowTrackedRanks(rank) {
     if (!rank) return false;
     const rankLower = rank.toLowerCase();
-    // If it's Gold or below, we've passed the ranks we care about
     const belowRanks = ['gold', 'silver', 'bronze', 'unranked'];
     return belowRanks.some(r => rankLower.includes(r));
 }
 
 async function updateHOFCache(progressCallback = null) {
-    console.log('[HOF] Updating faction Hall of Fame cache (Diamond & Platinum only)...');
+    hofLog.info({ trackedRanks: TRACKED_RANKS }, 'Updating faction Hall of Fame cache');
     
     const allFactions = [];
     let offset = 0;
@@ -4375,14 +4793,12 @@ async function updateHOFCache(progressCallback = null) {
             }
         }
         
-        // Stop if we've seen 50+ non-tracked factions in a row (we've passed Diamond/Platinum)
         if (consecutiveNonTracked >= 50) {
-            console.log(`[HOF] Reached Gold rank, stopping (found ${allFactions.length} Diamond/Platinum factions)`);
+            hofLog.info({ count: allFactions.length }, 'Reached Gold rank, stopping');
             hasMore = false;
             break;
         }
         
-        // Stop if no next page
         if (!data._metadata?.links?.next) {
             hasMore = false;
             break;
@@ -4390,14 +4806,12 @@ async function updateHOFCache(progressCallback = null) {
         
         offset += limit;
         
-        // Safety limit
         if (offset >= 2000) {
             hasMore = false;
             break;
         }
         
-        // Small delay between pages
-        await new Promise(r => setTimeout(r, 500));
+        await new Promise(r => setTimeout(r, config.hof.pageFetchDelayMs));
     }
     
     const cache = {
@@ -4413,7 +4827,7 @@ async function updateHOFCache(progressCallback = null) {
     
     saveHOFCache(cache);
     
-    console.log(`[HOF] Cached ${allFactions.length} factions (Diamond & Platinum)`);
+    hofLog.info({ count: allFactions.length }, 'HOF cache updated');
     
     return cache;
 }
@@ -4430,7 +4844,7 @@ function getFactionsbyRank(rankName, minMembers = null, maxMembers = null) {
     const rankLower = rankName.toLowerCase();
     
     if (!TRACKED_RANKS.includes(rankLower)) {
-        console.warn(`[HOF] Rank "${rankName}" is not tracked. Only ${TRACKED_RANKS.join(', ')} are available.`);
+        hofLog.warn({ rank: rankName, available: TRACKED_RANKS }, 'Rank not tracked');
         return [];
     }
     
@@ -4530,6 +4944,7 @@ File: src/utils/migrate.js
 const fs = require('fs');
 const path = require('path');
 const db = require('../database');
+const { dbLog } = require('./logger');
 
 const DATA_DIR = path.join(__dirname, '../../data');
 
@@ -4538,7 +4953,7 @@ async function migrate() {
     
     // Initialize database
     db.getDb();
-    console.log('✓ Database initialized\n');
+    dbLog.info('Database initialized');
     
     // Find all faction JSON files
     const files = fs.readdirSync(DATA_DIR).filter(f => 
@@ -4635,6 +5050,8 @@ File: src/database.js
 const Database = require('better-sqlite3');
 const path = require('path');
 const fs = require('fs');
+const config = require('./config');
+const { dbLog } = require('./utils/logger');
 
 const DATA_DIR = path.join(__dirname, '../data');
 const DB_PATH = path.join(DATA_DIR, 'activity.db');
@@ -4655,7 +5072,7 @@ function getDb() {
     db = new Database(DB_PATH);
     db.pragma('journal_mode = WAL');
     db.pragma('synchronous = NORMAL');
-    db.pragma('cache_size = -64000'); // 64MB cache
+    db.pragma('cache_size = -64000');
     
     initializeSchema();
     
@@ -4708,10 +5125,10 @@ function initializeSchema() {
         -- Pre-aggregated daily data (for faster heatmap generation)
         CREATE TABLE IF NOT EXISTS daily_aggregates (
             faction_id INTEGER NOT NULL,
-            date TEXT NOT NULL, -- YYYY-MM-DD
-            hour INTEGER NOT NULL, -- 0-23
-            day_of_week INTEGER NOT NULL, -- 0-6 (Sun-Sat)
-            slot INTEGER NOT NULL DEFAULT 0, -- 0-3 for 15-min slots, 0 for hourly
+            date TEXT NOT NULL,
+            hour INTEGER NOT NULL,
+            day_of_week INTEGER NOT NULL,
+            slot INTEGER NOT NULL DEFAULT 0,
             unique_active INTEGER NOT NULL,
             snapshot_count INTEGER NOT NULL,
             PRIMARY KEY (faction_id, date, hour, slot)
@@ -4767,30 +5184,18 @@ function getAllFactions() {
 }
 
 // ============================================
-// SNAPSHOT OPERATIONS
+// SNAPSHOT OPERATIONS (with batch inserts)
 // ============================================
 
 function addSnapshot(factionId, factionName, timestamp, activeMembers, totalCount) {
-    const db = getDb();
+    const database = getDb();
     
-    const insertSnapshot = db.prepare(`
+    const insertSnapshot = database.prepare(`
         INSERT INTO snapshots (faction_id, timestamp, active_count, total_count)
         VALUES (?, ?, ?, ?)
     `);
     
-    const insertMember = db.prepare(`
-        INSERT OR IGNORE INTO snapshot_members (snapshot_id, member_id)
-        VALUES (?, ?)
-    `);
-    
-    const updateMemberFaction = db.prepare(`
-        INSERT INTO member_factions (member_id, faction_id, first_seen, last_seen)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(member_id, faction_id) DO UPDATE SET
-            last_seen = excluded.last_seen
-    `);
-    
-    const transaction = db.transaction(() => {
+    const transaction = database.transaction(() => {
         // Upsert faction
         upsertFaction(factionId, factionName);
         
@@ -4798,10 +5203,37 @@ function addSnapshot(factionId, factionName, timestamp, activeMembers, totalCoun
         const result = insertSnapshot.run(factionId, timestamp, activeMembers.length, totalCount);
         const snapshotId = result.lastInsertRowid;
         
-        // Insert active members
-        for (const memberId of activeMembers) {
-            insertMember.run(snapshotId, memberId);
-            updateMemberFaction.run(memberId, factionId, timestamp, timestamp);
+        // BATCH INSERT active members
+        if (activeMembers.length > 0) {
+            const chunkSize = 500; // SQLite variable limit is 999
+            
+            for (let i = 0; i < activeMembers.length; i += chunkSize) {
+                const chunk = activeMembers.slice(i, i + chunkSize);
+                const placeholders = chunk.map(() => '(?, ?)').join(',');
+                const values = chunk.flatMap(id => [snapshotId, id]);
+                
+                database.prepare(
+                    `INSERT OR IGNORE INTO snapshot_members (snapshot_id, member_id) VALUES ${placeholders}`
+                ).run(...values);
+            }
+        }
+        
+        // BATCH UPDATE member_factions
+        if (activeMembers.length > 0) {
+            const chunkSize = 250; // Fewer per chunk due to more values per row
+            
+            for (let i = 0; i < activeMembers.length; i += chunkSize) {
+                const chunk = activeMembers.slice(i, i + chunkSize);
+                const placeholders = chunk.map(() => '(?, ?, ?, ?)').join(',');
+                const values = chunk.flatMap(id => [id, factionId, timestamp, timestamp]);
+                
+                database.prepare(`
+                    INSERT INTO member_factions (member_id, faction_id, first_seen, last_seen)
+                    VALUES ${placeholders}
+                    ON CONFLICT(member_id, faction_id) DO UPDATE SET
+                        last_seen = excluded.last_seen
+                `).run(...values);
+            }
         }
         
         // Update daily aggregate
@@ -4820,26 +5252,22 @@ function updateDailyAggregate(factionId, timestamp, activeMembers) {
     const dayOfWeek = date.getUTCDay();
     const slot = Math.floor(date.getUTCMinutes() / 15);
     
-    const db = getDb();
+    const database = getDb();
     
-    // Get existing aggregate
-    const existing = db.prepare(`
+    const existing = database.prepare(`
         SELECT unique_active, snapshot_count FROM daily_aggregates
         WHERE faction_id = ? AND date = ? AND hour = ? AND slot = ?
     `).get(factionId, dateStr, hour, slot);
     
     if (existing) {
-        // Update - we store cumulative unique count, so just increment snapshot_count
-        // For true unique, we'd need to store member sets, but this is a good approximation
-        db.prepare(`
+        database.prepare(`
             UPDATE daily_aggregates
             SET unique_active = unique_active + ?,
                 snapshot_count = snapshot_count + 1
             WHERE faction_id = ? AND date = ? AND hour = ? AND slot = ?
         `).run(activeMembers.length, factionId, dateStr, hour, slot);
     } else {
-        // Insert new
-        db.prepare(`
+        database.prepare(`
             INSERT INTO daily_aggregates (faction_id, date, hour, day_of_week, slot, unique_active, snapshot_count)
             VALUES (?, ?, ?, ?, ?, ?, 1)
         `).run(factionId, dateStr, hour, dayOfWeek, slot, activeMembers.length);
@@ -4892,27 +5320,27 @@ function getSnapshotCount(factionId) {
     return row ? row.count : 0;
 }
 
-function pruneOldData(daysToKeep = 30) {
+function pruneOldData(daysToKeep = config.collection.dataRetentionDays) {
     const cutoff = Math.floor(Date.now() / 1000) - (daysToKeep * 24 * 60 * 60);
-    const db = getDb();
+    const database = getDb();
     
-    const transaction = db.transaction(() => {
-        // Get snapshot IDs to delete
-        const snapshots = db.prepare('SELECT id FROM snapshots WHERE timestamp < ?').all(cutoff);
+    const transaction = database.transaction(() => {
+        const snapshots = database.prepare('SELECT id FROM snapshots WHERE timestamp < ?').all(cutoff);
         const snapshotIds = snapshots.map(s => s.id);
         
         if (snapshotIds.length === 0) return 0;
         
-        // Delete snapshot members
-        const placeholders = snapshotIds.map(() => '?').join(',');
-        db.prepare(`DELETE FROM snapshot_members WHERE snapshot_id IN (${placeholders})`).run(...snapshotIds);
+        // Batch delete in chunks
+        const chunkSize = 500;
+        for (let i = 0; i < snapshotIds.length; i += chunkSize) {
+            const chunk = snapshotIds.slice(i, i + chunkSize);
+            const placeholders = chunk.map(() => '?').join(',');
+            database.prepare(`DELETE FROM snapshot_members WHERE snapshot_id IN (${placeholders})`).run(...chunk);
+            database.prepare(`DELETE FROM snapshots WHERE id IN (${placeholders})`).run(...chunk);
+        }
         
-        // Delete snapshots
-        db.prepare(`DELETE FROM snapshots WHERE id IN (${placeholders})`).run(...snapshotIds);
-        
-        // Delete old aggregates
         const cutoffDate = new Date(cutoff * 1000).toISOString().split('T')[0];
-        db.prepare('DELETE FROM daily_aggregates WHERE date < ?').run(cutoffDate);
+        database.prepare('DELETE FROM daily_aggregates WHERE date < ?').run(cutoffDate);
         
         return snapshotIds.length;
     });
@@ -4921,7 +5349,7 @@ function pruneOldData(daysToKeep = 30) {
 }
 
 // ============================================
-// MEMBER OPERATIONS
+// MEMBER OPERATIONS (with batch inserts)
 // ============================================
 
 function upsertMember(memberId, name) {
@@ -4935,20 +5363,28 @@ function upsertMember(memberId, name) {
 }
 
 function upsertMembers(members) {
-    const stmt = getDb().prepare(`
-        INSERT INTO members (id, name, last_seen)
-        VALUES (?, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET
-            name = excluded.name,
-            last_seen = excluded.last_seen
-    `);
-    
+    const database = getDb();
     const now = Math.floor(Date.now() / 1000);
-    const transaction = getDb().transaction(() => {
-        for (const [id, data] of Object.entries(members)) {
-            if (data.name) {
-                stmt.run(parseInt(id), data.name, now);
-            }
+    
+    const entries = Object.entries(members).filter(([, data]) => data.name);
+    
+    if (entries.length === 0) return;
+    
+    const transaction = database.transaction(() => {
+        const chunkSize = 250;
+        
+        for (let i = 0; i < entries.length; i += chunkSize) {
+            const chunk = entries.slice(i, i + chunkSize);
+            const placeholders = chunk.map(() => '(?, ?, ?)').join(',');
+            const values = chunk.flatMap(([id, data]) => [parseInt(id), data.name, now]);
+            
+            database.prepare(`
+                INSERT INTO members (id, name, last_seen)
+                VALUES ${placeholders}
+                ON CONFLICT(id) DO UPDATE SET
+                    name = excluded.name,
+                    last_seen = excluded.last_seen
+            `).run(...values);
         }
     });
     
@@ -4985,26 +5421,81 @@ function getMemberFactions(memberId) {
 }
 
 // ============================================
-// AGGREGATION QUERIES (FAST)
+// LEADERBOARD QUERIES
 // ============================================
 
-function getHourlyAggregates(factionId, daysBack = 30) {
-    const cutoffDate = new Date(Date.now() - daysBack * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+function getMemberLeaderboard(factionId, days = 7, limit = 20) {
+    const since = Math.floor(Date.now() / 1000) - (days * 24 * 60 * 60);
     
     return getDb().prepare(`
         SELECT 
-            day_of_week,
-            hour,
-            SUM(unique_active) as total_active,
-            SUM(snapshot_count) as total_snapshots
-        FROM daily_aggregates
-        WHERE faction_id = ? AND date >= ?
-        GROUP BY day_of_week, hour
-        ORDER BY day_of_week, hour
-    `).all(factionId, cutoffDate);
+            sm.member_id,
+            m.name,
+            COUNT(*) as times_active,
+            (SELECT COUNT(*) FROM snapshots WHERE faction_id = ? AND timestamp >= ?) as total_snapshots
+        FROM snapshot_members sm
+        JOIN snapshots s ON sm.snapshot_id = s.id
+        LEFT JOIN members m ON sm.member_id = m.id
+        WHERE s.faction_id = ? AND s.timestamp >= ?
+        GROUP BY sm.member_id
+        ORDER BY times_active DESC
+        LIMIT ?
+    `).all(factionId, since, factionId, since, limit);
 }
 
-function get15MinAggregates(factionId, daysBack = 30) {
+function getMemberActivity(memberId, factionId, days = 30) {
+    const since = Math.floor(Date.now() / 1000) - (days * 24 * 60 * 60);
+    
+    const result = getDb().prepare(`
+        SELECT 
+            COUNT(*) as times_active,
+            (SELECT COUNT(*) FROM snapshots WHERE faction_id = ? AND timestamp >= ?) as total_snapshots
+        FROM snapshot_members sm
+        JOIN snapshots s ON sm.snapshot_id = s.id
+        WHERE sm.member_id = ? AND s.faction_id = ? AND s.timestamp >= ?
+    `).get(factionId, since, memberId, factionId, since);
+    
+    return {
+        timesActive: result?.times_active || 0,
+        totalSnapshots: result?.total_snapshots || 0,
+        percentage: result?.total_snapshots > 0 
+            ? Math.round((result.times_active / result.total_snapshots) * 100) 
+            : 0
+    };
+}
+
+// ============================================
+// AGGREGATION QUERIES (FAST)
+// ============================================
+
+function getHourlyAggregates(factionId, daysBack = config.collection.dataRetentionDays) {
+    const cutoff = Math.floor(Date.now() / 1000) - (daysBack * 24 * 60 * 60);
+    
+    // Get unique members per hour per week, then average across weeks
+    return getDb().prepare(`
+        WITH hourly_unique AS (
+            SELECT 
+                strftime('%Y-%W', datetime(s.timestamp, 'unixepoch')) as week,
+                CAST(strftime('%w', datetime(s.timestamp, 'unixepoch')) AS INTEGER) as day_of_week,
+                CAST(strftime('%H', datetime(s.timestamp, 'unixepoch')) AS INTEGER) as hour,
+                COUNT(DISTINCT sm.member_id) as unique_members
+            FROM snapshots s
+            JOIN snapshot_members sm ON s.id = sm.snapshot_id
+            WHERE s.faction_id = ? AND s.timestamp >= ?
+            GROUP BY week, day_of_week, hour
+        )
+        SELECT 
+            day_of_week,
+            hour,
+            ROUND(AVG(unique_members), 1) as avg_unique,
+            COUNT(*) as week_count
+        FROM hourly_unique
+        GROUP BY day_of_week, hour
+        ORDER BY day_of_week, hour
+    `).all(factionId, cutoff);
+}
+
+function get15MinAggregates(factionId, daysBack = config.collection.dataRetentionDays) {
     const cutoffDate = new Date(Date.now() - daysBack * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
     
     return getDb().prepare(`
@@ -5021,7 +5512,7 @@ function get15MinAggregates(factionId, daysBack = 30) {
     `).all(factionId, cutoffDate);
 }
 
-function getWeekCount(factionId, daysBack = 30) {
+function getWeekCount(factionId, daysBack = config.collection.dataRetentionDays) {
     const cutoffDate = new Date(Date.now() - daysBack * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
     
     const row = getDb().prepare(`
@@ -5034,7 +5525,7 @@ function getWeekCount(factionId, daysBack = 30) {
 }
 
 // ============================================
-// ACTIVITY CHECKING (for smart collection)
+// ACTIVITY CHECKING
 // ============================================
 
 function getRecentActivityLevel(factionId, hours = 6) {
@@ -5055,16 +5546,31 @@ function getRecentActivityLevel(factionId, hours = 6) {
 function isInactiveFaction(factionId) {
     const activity = getRecentActivityLevel(factionId, 24);
     
-    // Inactive if less than 5% activity over 24 hours
-    if (activity.snapshots === 0) return false; // New faction, always collect
+    if (activity.snapshots === 0) return false;
     
     const avgActive = activity.total_active / activity.snapshots;
     const faction = getFaction(factionId);
     
     if (!faction) return false;
     
-    // Consider inactive if average active < 2 members over 24h
     return avgActive < 2 && activity.max_active < 5;
+}
+
+function getFactionLastUpdated(factionId) {
+    const row = getDb().prepare('SELECT last_updated FROM factions WHERE id = ?').get(factionId);
+    return row ? row.last_updated * 1000 : 0; // Convert to milliseconds
+}
+
+function getUserLastUpdated(userId) {
+    // Get the most recent snapshot timestamp across all factions this user is in
+    const row = getDb().prepare(`
+        SELECT MAX(s.timestamp) as last_updated
+        FROM snapshots s
+        JOIN snapshot_members sm ON s.id = sm.snapshot_id
+        WHERE sm.member_id = ?
+    `).get(userId);
+    
+    return row?.last_updated ? row.last_updated * 1000 : 0;
 }
 
 // ============================================
@@ -5072,13 +5578,13 @@ function isInactiveFaction(factionId) {
 // ============================================
 
 function getDbStats() {
-    const db = getDb();
+    const database = getDb();
     
     return {
-        factions: db.prepare('SELECT COUNT(*) as count FROM factions').get().count,
-        snapshots: db.prepare('SELECT COUNT(*) as count FROM snapshots').get().count,
-        members: db.prepare('SELECT COUNT(*) as count FROM members').get().count,
-        aggregates: db.prepare('SELECT COUNT(*) as count FROM daily_aggregates').get().count,
+        factions: database.prepare('SELECT COUNT(*) as count FROM factions').get().count,
+        snapshots: database.prepare('SELECT COUNT(*) as count FROM snapshots').get().count,
+        members: database.prepare('SELECT COUNT(*) as count FROM members').get().count,
+        aggregates: database.prepare('SELECT COUNT(*) as count FROM daily_aggregates').get().count,
         dbSize: fs.existsSync(DB_PATH) ? fs.statSync(DB_PATH).size : 0
     };
 }
@@ -5108,6 +5614,10 @@ module.exports = {
     searchMembers,
     getMemberFactions,
     
+    // Leaderboard
+    getMemberLeaderboard,
+    getMemberActivity,
+    
     // Aggregates
     getHourlyAggregates,
     get15MinAggregates,
@@ -5118,7 +5628,451 @@ module.exports = {
     isInactiveFaction,
     
     // Stats
-    getDbStats
+    getDbStats,
+
+    // lastupdate
+    getFactionLastUpdated,
+    getUserLastUpdated,
+};
+
+================================================================================
+
+File: .env.example
+----------------------------------------
+# Discord Bot Configuration
+DISCORD_TOKEN=your_discord_bot_token
+DISCORD_CLIENT_ID=your_discord_client_id
+
+# Optional: Encryption key for API keys (generate with: npm run generate-key)
+# ENCRYPTION_KEY=your_64_character_hex_key
+
+# Optional: Logging level (debug, info, warn, error)
+# LOG_LEVEL=info
+
+# Optional: Environment (development or production)
+# NODE_ENV=production
+
+================================================================================
+
+File: README.md
+----------------------------------------
+# Torn Activity Bot
+
+A Discord bot that tracks member activity for Torn.com factions and generates visual heatmaps.
+
+## Features
+
+- **Activity Tracking**: Polls faction data every 15 minutes and records member activity
+- **Heatmaps**: Generates visual heatmaps showing activity patterns
+- **Granularity Options**: View data hourly or in 15-minute intervals
+- **Day Filtering**: Filter by weekdays, weekends, or specific days
+- **Faction Comparison**: Compare activity patterns between factions
+- **User Activity**: Track individual member activity patterns
+- **Multi-API Key Support**: Round-robin through multiple API keys to avoid rate limits
+
+## Prerequisites
+
+- Node.js 18.0.0 or higher
+- A Discord bot token
+- Torn API key(s)
+
+## Installation
+
+1. Clone the repository:
+```bash
+git clone https://github.com/yourusername/torn-activity-bot.git
+cd torn-activity-bot
+````
+
+2. Install dependencies:
+
+```bash
+npm install
+```
+
+3. Create your environment file:
+
+```bash
+cp .env.example .env
+```
+
+4. Edit `.env` and add your Discord credentials:
+
+```env
+DISCORD_TOKEN=your_discord_bot_token_here
+DISCORD_CLIENT_ID=your_client_id_here
+```
+
+5. Start the bot:
+
+```bash
+npm start
+```
+
+## Commands
+
+### Activity Commands
+
+#### `/activity faction`
+
+Generate a heatmap for a faction's activity.
+
+| Option        | Type    | Required | Description                                                                         |
+| ------------- | ------- | -------- | ----------------------------------------------------------------------------------- |
+| `id`          | Integer | Yes      | Faction ID                                                                          |
+| `granularity` | String  | No       | `hourly` (default) or `15min`                                                       |
+| `days`        | String  | No       | `all` (default), `weekday`, `weekend`, or comma-separated days (e.g. `mon,tue,wed`) |
+
+Example:
+
+```
+/activity faction id:47878 granularity:hourly days:weekend
+```
+
+#### `/activity user`
+
+Generate a heatmap for a specific user's activity.
+
+| Option        | Type    | Required | Description                                                    |
+| ------------- | ------- | -------- | -------------------------------------------------------------- |
+| `id`          | Integer | Yes      | User ID                                                        |
+| `granularity` | String  | No       | `hourly` (default) or `15min`                                  |
+| `days`        | String  | No       | `all` (default), `weekday`, `weekend`, or comma-separated days |
+
+Example:
+
+```
+/activity user id:2393235 granularity:15min days:all
+```
+
+#### `/activity compare`
+
+Compare activity between two factions with side-by-side and difference heatmaps.
+
+| Option        | Type    | Required | Description                                                    |
+| ------------- | ------- | -------- | -------------------------------------------------------------- |
+| `faction1`    | Integer | Yes      | First faction ID                                               |
+| `faction2`    | Integer | Yes      | Second faction ID                                              |
+| `granularity` | String  | No       | `hourly` (default) or `15min`                                  |
+| `days`        | String  | No       | `all` (default), `weekday`, `weekend`, or comma-separated days |
+
+Example:
+
+```
+/activity compare faction1:47878 faction2:36274 days:weekday
+```
+
+### Configuration Commands
+
+#### `/config add`
+
+Add factions or API keys to track.
+
+| Option     | Type   | Required | Description                 |
+| ---------- | ------ | -------- | --------------------------- |
+| `factions` | String | No       | Comma-separated faction IDs |
+| `apikeys`  | String | No       | Comma-separated API keys    |
+
+Example:
+
+```
+/config add factions:47878,36274 apikeys:abc123,def456
+```
+
+#### `/config remove`
+
+Remove a faction or API key.
+
+| Option    | Type    | Required | Description          |
+| --------- | ------- | -------- | -------------------- |
+| `faction` | Integer | No       | Faction ID to remove |
+| `apikey`  | String  | No       | API key to remove    |
+
+Example:
+
+```
+/config remove faction:47878
+```
+
+#### `/config list`
+
+Show current configuration, including factions tracked and number of API keys.
+
+## How Activity Is Calculated
+
+A member is considered active if their `last_action.timestamp` is within 15 minutes of when the API was polled.
+
+### Faction Heatmaps
+
+Shows the average number of active members at each time slot over the past 30 days.
+
+### User Heatmaps
+
+Shows how many weeks (out of approximately 4) the user was active at each time slot.
+
+### Heatmap Color Scale
+
+* 🟥 Red: Low activity
+* 🟨 Yellow: Medium activity
+* 🟩 Green: High activity
+
+## Data Storage
+
+* Data is stored in JSON files in the `data/` directory
+* Each faction has its own file: `data/faction_XXXXX.json`
+* Data is automatically pruned after 30 days
+* Only active member IDs are stored to keep file sizes small
+
+## API Rate Limiting
+
+The bot rotates through all configured API keys to avoid hitting rate limits. Torn allows approximately 100 requests per minute per key.
+
+Recommended: Add at least 2 to 3 API keys if tracking more than 5 factions.
+
+## Time Zone
+
+All times are displayed in TCT (Torn City Time), which is equivalent to UTC.
+
+## Troubleshooting
+
+### "No data available"
+
+The bot needs to collect data before it can generate heatmaps. Wait at least a few hours after adding a faction.
+
+### Canvas installation issues
+
+On some systems, you may need to install additional dependencies for the `canvas` package.
+
+**Ubuntu/Debian:**
+
+```bash
+sudo apt-get install build-essential libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev
+```
+
+**macOS:**
+
+```bash
+brew install pkg-config cairo pango libpng jpeg giflib librsvg
+```
+
+### Bot not responding
+
+* Check that `DISCORD_TOKEN` is correct in `.env`
+* Ensure the bot has been invited to your server with proper permissions
+* Check the console for error messages
+
+## License
+
+MIT
+
+```
+
+
+
+================================================================================
+
+File: src/utils/crypto.js
+----------------------------------------
+const crypto = require('crypto');
+const config = require('../config');
+
+const ALGORITHM = config.crypto.algorithm;
+const KEY_LENGTH = 32; // 256 bits for aes-256
+
+function getEncryptionKey() {
+    const key = process.env.ENCRYPTION_KEY;
+    
+    if (!key) {
+        return null; // Encryption disabled
+    }
+    
+    // If key is hex string, convert to buffer
+    if (key.length === 64) {
+        return Buffer.from(key, 'hex');
+    }
+    
+    // Otherwise hash it to get consistent 32 bytes
+    return crypto.createHash('sha256').update(key).digest();
+}
+
+function encrypt(text) {
+    const key = getEncryptionKey();
+    
+    if (!key) {
+        return text; // No encryption key, store plaintext
+    }
+    
+    const iv = crypto.randomBytes(16);
+    const cipher = crypto.createCipheriv(ALGORITHM, key, iv);
+    
+    const encrypted = Buffer.concat([
+        cipher.update(text, 'utf8'),
+        cipher.final()
+    ]);
+    
+    const tag = cipher.getAuthTag();
+    
+    // Format: iv:encrypted:tag (all hex)
+    return `enc:${iv.toString('hex')}:${encrypted.toString('hex')}:${tag.toString('hex')}`;
+}
+
+function decrypt(encryptedText) {
+    // Check if it's encrypted
+    if (!encryptedText.startsWith('enc:')) {
+        return encryptedText; // Plaintext, return as-is
+    }
+    
+    const key = getEncryptionKey();
+    
+    if (!key) {
+        throw new Error('Cannot decrypt: ENCRYPTION_KEY not set');
+    }
+    
+    const parts = encryptedText.slice(4).split(':'); // Remove 'enc:' prefix
+    
+    if (parts.length !== 3) {
+        throw new Error('Invalid encrypted format');
+    }
+    
+    const iv = Buffer.from(parts[0], 'hex');
+    const encrypted = Buffer.from(parts[1], 'hex');
+    const tag = Buffer.from(parts[2], 'hex');
+    
+    const decipher = crypto.createDecipheriv(ALGORITHM, key, iv);
+    decipher.setAuthTag(tag);
+    
+    const decrypted = Buffer.concat([
+        decipher.update(encrypted),
+        decipher.final()
+    ]);
+    
+    return decrypted.toString('utf8');
+}
+
+function isEncrypted(text) {
+    return text && text.startsWith('enc:');
+}
+
+function generateKey() {
+    return crypto.randomBytes(KEY_LENGTH).toString('hex');
+}
+
+module.exports = {
+    encrypt,
+    decrypt,
+    isEncrypted,
+    generateKey
+};
+
+================================================================================
+
+File: src/utils/encrypt-keys.js
+----------------------------------------
+/**
+ * Utility script to encrypt existing API keys in config.json
+ * Run with: npm run encrypt-keys
+ */
+
+const fs = require('fs');
+const path = require('path');
+const { encrypt, isEncrypted, generateKey } = require('./crypto');
+
+const CONFIG_PATH = path.join(__dirname, '../../config.json');
+
+function main() {
+    // Check if ENCRYPTION_KEY is set
+    if (!process.env.ENCRYPTION_KEY) {
+        console.log('⚠️  ENCRYPTION_KEY not set in environment.\n');
+        console.log('To enable encryption:');
+        console.log('1. Generate a key:');
+        console.log(`   ${generateKey()}`);
+        console.log('\n2. Add to your .env file:');
+        console.log('   ENCRYPTION_KEY=<generated-key>\n');
+        console.log('3. Run this script again.\n');
+        return;
+    }
+    
+    // Load config
+    let config;
+    try {
+        config = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+    } catch (error) {
+        console.error('❌ Could not read config.json:', error.message);
+        return;
+    }
+    
+    if (!config.apikeys || config.apikeys.length === 0) {
+        console.log('ℹ️  No API keys found in config.json');
+        return;
+    }
+    
+    // Check which keys need encryption
+    let encrypted = 0;
+    let alreadyEncrypted = 0;
+    
+    config.apikeys = config.apikeys.map(key => {
+        if (isEncrypted(key)) {
+            alreadyEncrypted++;
+            return key;
+        }
+        encrypted++;
+        return encrypt(key);
+    });
+    
+    if (encrypted === 0) {
+        console.log('✅ All API keys are already encrypted.');
+        return;
+    }
+    
+    // Save config
+    fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2));
+    
+    console.log(`✅ Encrypted ${encrypted} API key(s).`);
+    if (alreadyEncrypted > 0) {
+        console.log(`ℹ️  ${alreadyEncrypted} key(s) were already encrypted.`);
+    }
+}
+
+// Load dotenv for ENCRYPTION_KEY
+require('dotenv').config();
+main();
+
+================================================================================
+
+File: src/utils/logger.js
+----------------------------------------
+const pino = require('pino');
+
+const isDev = process.env.NODE_ENV !== 'production';
+
+const logger = pino({
+    level: process.env.LOG_LEVEL || (isDev ? 'debug' : 'info'),
+    transport: isDev ? {
+        target: 'pino-pretty',
+        options: {
+            colorize: true,
+            translateTime: 'SYS:standard',
+            ignore: 'pid,hostname'
+        }
+    } : undefined,
+    base: {
+        pid: undefined,
+        hostname: undefined
+    },
+    formatters: {
+        level: (label) => ({ level: label })
+    }
+});
+
+// Create child loggers for different modules
+module.exports = {
+    logger,
+    collectorLog: logger.child({ module: 'collector' }),
+    apiLog: logger.child({ module: 'api' }),
+    dbLog: logger.child({ module: 'db' }),
+    hofLog: logger.child({ module: 'hof' }),
+    botLog: logger.child({ module: 'bot' }),
+    cmdLog: logger.child({ module: 'command' })
 };
 
 ================================================================================

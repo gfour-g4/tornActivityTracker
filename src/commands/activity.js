@@ -517,7 +517,7 @@ async function handleLeaderboard(interaction) {
             });
         }
         
-        const leaderboard = db.getMemberLeaderboard(faction.id, period, 20);
+        const leaderboard = db.getMemberLeaderboard(faction.id, period, 15);
         
         if (leaderboard.length === 0) {
             return await interaction.editReply({
@@ -526,25 +526,22 @@ async function handleLeaderboard(interaction) {
         }
         
         const totalSnapshots = leaderboard[0]?.total_snapshots || 0;
+        const lastUpdated = db.getFactionLastUpdated(faction.id);
         
-        let response = `**📊 ${faction.name} - Activity Leaderboard (${period} Days)**\n`;
-        response += `*${totalSnapshots} data points collected*\n\n`;
+        const imageBuffer = heatmap.generateLeaderboardImage(
+            faction.name,
+            faction.id,
+            leaderboard,
+            period,
+            totalSnapshots,
+            lastUpdated
+        );
         
-        const medals = ['🥇', '🥈', '🥉'];
+        const attachment = new AttachmentBuilder(imageBuffer, { 
+            name: `leaderboard_${faction.id}.png` 
+        });
         
-        for (let i = 0; i < leaderboard.length; i++) {
-            const member = leaderboard[i];
-            const percentage = totalSnapshots > 0 
-                ? Math.round((member.times_active / totalSnapshots) * 100) 
-                : 0;
-            
-            const medal = medals[i] || `**${i + 1}.**`;
-            const name = member.name || `User ${member.member_id}`;
-            
-            response += `${medal} ${name} - ${percentage}% (${member.times_active}/${totalSnapshots})\n`;
-        }
-        
-        await interaction.editReply({ content: response });
+        await interaction.editReply({ files: [attachment] });
         
     } catch (error) {
         cmdLog.error({ error: error.message, input }, 'Leaderboard error');

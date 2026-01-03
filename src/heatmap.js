@@ -749,6 +749,172 @@ function generateDifferenceImage(title1, data1, title2, data2, lastUpdated = nul
     return canvas.toBuffer('image/png');
 }
 
+// Add at the top with other functions
+
+function generateLeaderboardImage(factionName, factionId, leaderboard, period, totalSnapshots, lastUpdated = null) {
+    const rowHeight = 44;
+    const headerHeight = 80;
+    const footerHeight = 50;
+    const padding = 24;
+    const width = 500;
+    const height = headerHeight + (leaderboard.length * rowHeight) + footerHeight + padding * 2;
+    
+    const canvas = createCanvas(width, height);
+    const ctx = canvas.getContext('2d');
+    
+    // Background
+    ctx.fillStyle = '#1a1a2e';
+    ctx.fillRect(0, 0, width, height);
+    
+    // Header background
+    const headerGradient = ctx.createLinearGradient(0, 0, width, 0);
+    headerGradient.addColorStop(0, '#16213e');
+    headerGradient.addColorStop(1, '#1a1a2e');
+    ctx.fillStyle = headerGradient;
+    ctx.fillRect(0, 0, width, headerHeight + padding);
+    
+    // Title
+    ctx.fillStyle = '#FFFFFF';
+    ctx.font = 'bold 22px Arial';
+    ctx.textAlign = 'left';
+    ctx.fillText(`📊 ${factionName}`, padding, padding + 28);
+    
+    // Subtitle
+    ctx.fillStyle = '#8892b0';
+    ctx.font = '14px Arial';
+    ctx.fillText(`Activity Leaderboard • Last ${period} days`, padding, padding + 52);
+    
+    // Data points badge
+    ctx.fillStyle = '#233554';
+    const badgeText = `${totalSnapshots} snapshots`;
+    const badgeWidth = ctx.measureText(badgeText).width + 20;
+    const badgeX = width - padding - badgeWidth;
+    roundRect(ctx, badgeX, padding + 15, badgeWidth, 28, 14);
+    ctx.fill();
+    
+    ctx.fillStyle = '#64ffda';
+    ctx.font = '12px Arial';
+    ctx.textAlign = 'center';
+    ctx.fillText(badgeText, badgeX + badgeWidth / 2, padding + 34);
+    
+    // Leaderboard rows
+    const startY = headerHeight + padding + 10;
+    
+    const medals = ['🥇', '🥈', '🥉'];
+    const medalColors = ['#FFD700', '#C0C0C0', '#CD7F32'];
+    
+    for (let i = 0; i < leaderboard.length; i++) {
+        const member = leaderboard[i];
+        const y = startY + (i * rowHeight);
+        const percentage = totalSnapshots > 0 
+            ? Math.round((member.times_active / totalSnapshots) * 100) 
+            : 0;
+        
+        // Row background (alternating)
+        if (i % 2 === 0) {
+            ctx.fillStyle = 'rgba(255, 255, 255, 0.02)';
+            ctx.fillRect(padding - 8, y - 8, width - padding * 2 + 16, rowHeight);
+        }
+        
+        // Rank
+        ctx.textAlign = 'left';
+        if (i < 3) {
+            ctx.font = '20px Arial';
+            ctx.fillText(medals[i], padding, y + 20);
+        } else {
+            ctx.fillStyle = '#4a5568';
+            ctx.font = 'bold 14px Arial';
+            ctx.fillText(`${i + 1}`, padding + 4, y + 18);
+        }
+        
+        // Name
+        const name = member.name || `User ${member.member_id}`;
+        ctx.fillStyle = i < 3 ? '#FFFFFF' : '#cbd5e0';
+        ctx.font = i < 3 ? 'bold 15px Arial' : '14px Arial';
+        ctx.fillText(truncateText(ctx, name, 180), padding + 40, y + 18);
+        
+        // Progress bar background
+        const barX = 240;
+        const barWidth = 150;
+        const barHeight = 16;
+        const barY = y + 6;
+        
+        ctx.fillStyle = '#233554';
+        roundRect(ctx, barX, barY, barWidth, barHeight, 8);
+        ctx.fill();
+        
+        // Progress bar fill
+        const fillWidth = Math.max(2, (percentage / 100) * barWidth);
+        const barGradient = ctx.createLinearGradient(barX, 0, barX + barWidth, 0);
+        
+        if (percentage >= 70) {
+            barGradient.addColorStop(0, '#10b981');
+            barGradient.addColorStop(1, '#34d399');
+        } else if (percentage >= 40) {
+            barGradient.addColorStop(0, '#f59e0b');
+            barGradient.addColorStop(1, '#fbbf24');
+        } else {
+            barGradient.addColorStop(0, '#ef4444');
+            barGradient.addColorStop(1, '#f87171');
+        }
+        
+        ctx.fillStyle = barGradient;
+        roundRect(ctx, barX, barY, fillWidth, barHeight, 8);
+        ctx.fill();
+        
+        // Percentage text
+        ctx.fillStyle = '#FFFFFF';
+        ctx.font = 'bold 12px Arial';
+        ctx.textAlign = 'right';
+        ctx.fillText(`${percentage}%`, width - padding, y + 18);
+    }
+    
+    // Footer
+    const footerY = height - footerHeight;
+    
+    ctx.fillStyle = '#4a5568';
+    ctx.font = '11px Arial';
+    ctx.textAlign = 'left';
+    ctx.fillText(`Faction ID: ${factionId}`, padding, footerY + 25);
+    
+    if (lastUpdated) {
+        ctx.textAlign = 'right';
+        ctx.fillText(`Updated: ${formatLastUpdated(lastUpdated)}`, width - padding, footerY + 25);
+    }
+    
+    return canvas.toBuffer('image/png');
+}
+
+// Helper function for rounded rectangles
+function roundRect(ctx, x, y, width, height, radius) {
+    ctx.beginPath();
+    ctx.moveTo(x + radius, y);
+    ctx.lineTo(x + width - radius, y);
+    ctx.quadraticCurveTo(x + width, y, x + width, y + radius);
+    ctx.lineTo(x + width, y + height - radius);
+    ctx.quadraticCurveTo(x + width, y + height, x + width - radius, y + height);
+    ctx.lineTo(x + radius, y + height);
+    ctx.quadraticCurveTo(x, y + height, x, y + height - radius);
+    ctx.lineTo(x, y + radius);
+    ctx.quadraticCurveTo(x, y, x + radius, y);
+    ctx.closePath();
+}
+
+// Helper function to truncate text
+function truncateText(ctx, text, maxWidth) {
+    let truncated = text;
+    while (ctx.measureText(truncated).width > maxWidth && truncated.length > 0) {
+        truncated = truncated.slice(0, -1);
+    }
+    if (truncated !== text) {
+        truncated = truncated.slice(0, -2) + '…';
+    }
+    return truncated;
+}
+
+
+
+
 // ============================================
 // PUBLIC API (with cache invalidation)
 // ============================================
@@ -863,5 +1029,9 @@ async function createComparisonHeatmaps(faction1Id, faction2Id, granularity, day
 module.exports = {
     createFactionHeatmap,
     createUserHeatmap,
-    createComparisonHeatmaps
+    createComparisonHeatmaps,
+    createFactionHeatmap,
+    createUserHeatmap,
+    createComparisonHeatmaps,
+    generateLeaderboardImage
 };
