@@ -749,7 +749,6 @@ function generateDifferenceImage(title1, data1, title2, data2, lastUpdated = nul
     return canvas.toBuffer('image/png');
 }
 
-// Add at the top with other functions
 
 function generateLeaderboardImage(factionName, factionId, leaderboard, period, totalSnapshots, lastUpdated = null) {
     const rowHeight = 44;
@@ -777,7 +776,10 @@ function generateLeaderboardImage(factionName, factionId, leaderboard, period, t
     ctx.fillStyle = '#FFFFFF';
     ctx.font = 'bold 22px Arial';
     ctx.textAlign = 'left';
-    ctx.fillText(`📊 ${factionName}`, padding, padding + 28);
+    ctx.fillText(factionName, padding + 30, padding + 28);
+    
+    // Trophy icon (drawn)
+    drawTrophy(ctx, padding + 6, padding + 10, 20, '#FFD700');
     
     // Subtitle
     ctx.fillStyle = '#8892b0';
@@ -800,8 +802,11 @@ function generateLeaderboardImage(factionName, factionId, leaderboard, period, t
     // Leaderboard rows
     const startY = headerHeight + padding + 10;
     
-    const medals = ['🥇', '🥈', '🥉'];
-    const medalColors = ['#FFD700', '#C0C0C0', '#CD7F32'];
+    const medalColors = [
+        { bg: '#FFD700', text: '#000000' }, // Gold
+        { bg: '#C0C0C0', text: '#000000' }, // Silver
+        { bg: '#CD7F32', text: '#FFFFFF' }  // Bronze
+    ];
     
     for (let i = 0; i < leaderboard.length; i++) {
         const member = leaderboard[i];
@@ -816,28 +821,52 @@ function generateLeaderboardImage(factionName, factionId, leaderboard, period, t
             ctx.fillRect(padding - 8, y - 8, width - padding * 2 + 16, rowHeight);
         }
         
-        // Rank
-        ctx.textAlign = 'left';
+        // Rank badge
+        const rankX = padding + 12;
+        const rankY = y + 12;
+        
         if (i < 3) {
-            ctx.font = '20px Arial';
-            ctx.fillText(medals[i], padding, y + 20);
+            // Medal circle for top 3
+            ctx.beginPath();
+            ctx.arc(rankX, rankY, 12, 0, Math.PI * 2);
+            ctx.fillStyle = medalColors[i].bg;
+            ctx.fill();
+            
+            // Rank number inside medal
+            ctx.fillStyle = medalColors[i].text;
+            ctx.font = 'bold 12px Arial';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText(`${i + 1}`, rankX, rankY);
         } else {
-            ctx.fillStyle = '#4a5568';
-            ctx.font = 'bold 14px Arial';
-            ctx.fillText(`${i + 1}`, padding + 4, y + 18);
+            // Simple circle for others
+            ctx.beginPath();
+            ctx.arc(rankX, rankY, 12, 0, Math.PI * 2);
+            ctx.fillStyle = '#233554';
+            ctx.fill();
+            
+            ctx.fillStyle = '#8892b0';
+            ctx.font = 'bold 11px Arial';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText(`${i + 1}`, rankX, rankY);
         }
+        
+        // Reset text baseline
+        ctx.textBaseline = 'alphabetic';
         
         // Name
         const name = member.name || `User ${member.member_id}`;
         ctx.fillStyle = i < 3 ? '#FFFFFF' : '#cbd5e0';
         ctx.font = i < 3 ? 'bold 15px Arial' : '14px Arial';
-        ctx.fillText(truncateText(ctx, name, 180), padding + 40, y + 18);
+        ctx.textAlign = 'left';
+        ctx.fillText(truncateText(ctx, name, 180), padding + 36, y + 17);
         
         // Progress bar background
         const barX = 240;
         const barWidth = 150;
         const barHeight = 16;
-        const barY = y + 6;
+        const barY = y + 4;
         
         ctx.fillStyle = '#233554';
         roundRect(ctx, barX, barY, barWidth, barHeight, 8);
@@ -866,7 +895,7 @@ function generateLeaderboardImage(factionName, factionId, leaderboard, period, t
         ctx.fillStyle = '#FFFFFF';
         ctx.font = 'bold 12px Arial';
         ctx.textAlign = 'right';
-        ctx.fillText(`${percentage}%`, width - padding, y + 18);
+        ctx.fillText(`${percentage}%`, width - padding, y + 17);
     }
     
     // Footer
@@ -883,6 +912,67 @@ function generateLeaderboardImage(factionName, factionId, leaderboard, period, t
     }
     
     return canvas.toBuffer('image/png');
+}
+
+// Helper: Draw a simple trophy shape
+function drawTrophy(ctx, x, y, size, color) {
+    ctx.fillStyle = color;
+    
+    // Cup body
+    ctx.beginPath();
+    ctx.moveTo(x, y);
+    ctx.lineTo(x + size, y);
+    ctx.lineTo(x + size * 0.85, y + size * 0.6);
+    ctx.lineTo(x + size * 0.15, y + size * 0.6);
+    ctx.closePath();
+    ctx.fill();
+    
+    // Stem
+    ctx.fillRect(x + size * 0.35, y + size * 0.6, size * 0.3, size * 0.25);
+    
+    // Base
+    ctx.fillRect(x + size * 0.2, y + size * 0.85, size * 0.6, size * 0.15);
+    
+    // Handles
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    
+    // Left handle
+    ctx.beginPath();
+    ctx.arc(x - 2, y + size * 0.25, size * 0.15, -Math.PI * 0.5, Math.PI * 0.5);
+    ctx.stroke();
+    
+    // Right handle
+    ctx.beginPath();
+    ctx.arc(x + size + 2, y + size * 0.25, size * 0.15, Math.PI * 0.5, -Math.PI * 0.5);
+    ctx.stroke();
+}
+
+// Helper function for rounded rectangles
+function roundRect(ctx, x, y, width, height, radius) {
+    ctx.beginPath();
+    ctx.moveTo(x + radius, y);
+    ctx.lineTo(x + width - radius, y);
+    ctx.quadraticCurveTo(x + width, y, x + width, y + radius);
+    ctx.lineTo(x + width, y + height - radius);
+    ctx.quadraticCurveTo(x + width, y + height, x + width - radius, y + height);
+    ctx.lineTo(x + radius, y + height);
+    ctx.quadraticCurveTo(x, y + height, x, y + height - radius);
+    ctx.lineTo(x, y + radius);
+    ctx.quadraticCurveTo(x, y, x + radius, y);
+    ctx.closePath();
+}
+
+// Helper function to truncate text
+function truncateText(ctx, text, maxWidth) {
+    let truncated = text;
+    while (ctx.measureText(truncated).width > maxWidth && truncated.length > 0) {
+        truncated = truncated.slice(0, -1);
+    }
+    if (truncated !== text) {
+        truncated = truncated.slice(0, -2) + '…';
+    }
+    return truncated;
 }
 
 // Helper function for rounded rectangles
