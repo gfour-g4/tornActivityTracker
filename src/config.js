@@ -7,12 +7,13 @@ module.exports = {
     
     // API rate limiting
     api: {
-        callsPerKeyPerMinute: 20,
+        defaultCallsPerKeyPerMinute: 20,  // Default if not specified
+        maxCallsPerKeyPerMinute: 20,      // Hard cap
         maxConcurrency: 10,
         retryAttempts: 3,
         retryDelayMs: 1000,
         rateLimitWindowMs: 60 * 1000,
-        failedKeyTimeoutMs: 5 * 60 * 1000,     // 5 minutes
+        failedKeyTimeoutMs: 5 * 60 * 1000,
     },
     
     // Hall of Fame

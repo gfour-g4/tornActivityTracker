@@ -166,15 +166,22 @@ module.exports = {
         )
         .addSubcommand(subcommand =>
             subcommand
-                .setName('add-keys')
-                .setDescription('Add API keys')
+                .setName('add-key')
+                .setDescription('Add an API key')
                 .addStringOption(option =>
                     option
-                        .setName('keys')
-                        .setDescription('Comma-separated API keys')
+                        .setName('key')
+                        .setDescription('API key')
                         .setRequired(true)
                 )
-        )
+                .addIntegerOption(option =>
+                    option
+                        .setName('rate-limit')
+                        .setDescription('Max calls per minute (default: 20, max: 20)')
+                        .setMinValue(1)
+                        .setMaxValue(20)
+                )
+        )        
         .addSubcommand(subcommand =>
             subcommand
                 .setName('remove-factions')
@@ -357,8 +364,8 @@ module.exports = {
             return await handleAddRank(interaction);
         }
         
-        if (subcommand === 'add-keys') {
-            return await handleAddKeys(interaction);
+        if (subcommand === 'add-key') {
+            return await handleAddKey(interaction);
         }
         
         if (subcommand === 'remove-factions') {
@@ -650,29 +657,25 @@ async function handleAddRank(interaction) {
     }
 }
 
-async function handleAddKeys(interaction) {
-    const keysInput = interaction.options.getString('keys');
+async function handleAddKey(interaction) {
+    const key = interaction.options.getString('key');
+    const rateLimit = interaction.options.getInteger('rate-limit');
     
-    const keys = keysInput.split(',')
-        .map(k => k.trim())
-        .filter(k => k.length > 0);
+    const result = storage.addApiKey(key, rateLimit);
     
-    if (keys.length === 0) {
-        return await interaction.reply({
-            content: '❌ No valid API keys provided.',
+    if (result.added) {
+        cmdLog.info({ rateLimit: result.rateLimit }, 'API key added');
+        
+        await interaction.reply({
+            content: `✅ API key added with rate limit: **${result.rateLimit}** calls/min`,
+            ephemeral: true
+        });
+    } else {
+        await interaction.reply({
+            content: `❌ ${result.reason}`,
             ephemeral: true
         });
     }
-    
-    const result = storage.addApiKeys(keys);
-    
-    cmdLog.info({ added: result.added, skipped: result.skipped }, 'API keys added');
-    
-    await interaction.reply({
-        content: `✅ Added **${result.added}** API key(s)` + 
-            (result.skipped > 0 ? ` (${result.skipped} already exist)` : ''),
-        ephemeral: true
-    });
 }
 
 async function handleRemoveFactions(interaction) {
@@ -779,6 +782,7 @@ async function handleList(interaction) {
     
     let response = '**📊 Activity Tracker Configuration**\n\n';
     
+    // Factions section (unchanged)
     response += `**Factions:** ${config.factions.length} tracked\n`;
     
     if (config.factions.length > 0 && config.factions.length <= 20) {
@@ -803,19 +807,29 @@ async function handleList(interaction) {
         }
     }
     
+    // API Keys section - show rate limits
     response += `\n**API Keys:** ${config.apikeys.length} configured\n`;
     
+    for (const entry of config.apikeys) {
+        const masked = `...${entry.key.slice(-4)}`;
+        response += `> • Key ${masked}: ${entry.rateLimit} calls/min\n`;
+    }
+    
+    // Calculate totals
+    const totalRateLimit = config.apikeys.reduce((sum, e) => sum + e.rateLimit, 0);
     const estimate = api.estimateCollectionTime(config.factions.length);
+    
     response += `\n**Collection:**\n`;
-    response += `> Rate limit: ${api.RATE_LIMIT_PER_KEY} calls/min/key\n`;
-    response += `> Max throughput: ${config.apikeys.length * api.RATE_LIMIT_PER_KEY} calls/min\n`;
+    response += `> Total throughput: ${totalRateLimit} calls/min\n`;
     response += `> Est. collection time: ${Math.ceil(estimate / 60)} min\n`;
     
     if (estimate > 14 * 60) {
-        const neededKeys = Math.ceil(config.factions.length / (api.RATE_LIMIT_PER_KEY * 14));
-        response += `\n⚠️ **Warning:** Need ${neededKeys}+ keys to finish in 15 min!\n`;
+        const currentThroughput = totalRateLimit;
+        const neededThroughput = Math.ceil(config.factions.length / 14);
+        response += `\n⚠️ **Warning:** Need ${neededThroughput} calls/min to finish in 15 min! (Currently: ${currentThroughput})\n`;
     }
     
+    // HOF cache section (unchanged)
     response += `\n**HOF Cache:**\n`;
     response += `> Total factions: ${hofStats.total}\n`;
     
@@ -824,6 +838,44 @@ async function handleList(interaction) {
         response += `> Last updated: ${age} hours ago\n`;
     } else {
         response += `> Not yet cached\n`;
+    }
+    
+    await interaction.reply({ content: response, ephemeral: true });
+}
+
+// Update handleStatus to show per-key limits
+async function handleStatus(interaction) {
+    const status = collector.getCollectorStatus();
+    
+    let response = '**🔄 Collector Status**\n\n';
+    
+    const stateEmoji = status.running ? (status.collecting ? '🟡' : '🟢') : '🔴';
+    const stateText = status.running ? (status.collecting ? 'Collecting...' : 'Running') : 'Stopped';
+    
+    response += `**State:** ${stateEmoji} ${stateText}\n`;
+    response += `**Factions:** ${status.factionCount}\n`;
+    response += `**API Keys:** ${status.keyCount}\n`;
+    response += `**Est. Collection Time:** ${Math.ceil(status.estimatedCollectionTime / 60)} min\n`;
+    response += `**Next Slot:** ${status.nextSlot}\n`;
+    
+    if (status.lastCollection) {
+        const last = status.lastCollection;
+        const duration = Math.floor((last.endTime - last.startTime) / 1000);
+        const ago = Math.floor((Date.now() - last.endTime) / 1000 / 60);
+        
+        response += `\n**Last Collection:**\n`;
+        response += `> Completed: ${ago} min ago\n`;
+        response += `> Success: ${last.success}/${last.success + last.failed}\n`;
+        if (last.skipped > 0) {
+            response += `> Skipped: ${last.skipped} (already collected)\n`;
+        }
+        response += `> Duration: ${Math.floor(duration / 60)}m ${duration % 60}s\n`;
+    }
+    
+    response += `\n**API Key Usage (current minute):**\n`;
+    for (const [key, info] of Object.entries(status.rateLimitStatus)) {
+        const emoji = info.failed ? '❌' : (info.calls >= info.limit ? '🟡' : '🟢');
+        response += `> ${emoji} Key ${key}: ${info.calls}/${info.limit} calls\n`;
     }
     
     await interaction.reply({ content: response, ephemeral: true });

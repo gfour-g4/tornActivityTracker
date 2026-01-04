@@ -30,9 +30,15 @@ function logCall(key) {
     apiCallLog.set(key, calls);
 }
 
+function getKeyRateLimit(key) {
+    return storage.getKeyRateLimit(key);
+}
+
 function getTimeUntilSlotAvailable(key) {
     const calls = cleanOldCalls(key);
-    if (calls.length < config.api.callsPerKeyPerMinute) {
+    const rateLimit = getKeyRateLimit(key);
+    
+    if (calls.length < rateLimit) {
         return 0;
     }
     const oldestCall = Math.min(...calls);
@@ -62,16 +68,17 @@ function findAvailableKey(excludeKeys = []) {
         storage.saveConfig(storageConfig);
     }
     
-    const availableKeys = storageConfig.apikeys.filter(k => 
-        !excludeKeys.includes(k) && !storageConfig.failedKeys[k]
+    // Get available keys
+    const availableKeys = storageConfig.apikeys.filter(entry => 
+        !excludeKeys.includes(entry.key) && !storageConfig.failedKeys[entry.key]
     );
     
     if (availableKeys.length === 0) {
         if (Object.keys(storageConfig.failedKeys).length > 0) {
             storageConfig.failedKeys = {};
             storage.saveConfig(storageConfig);
-            const key = storageConfig.apikeys.find(k => !excludeKeys.includes(k));
-            return { key: key || null, waitTime: 0 };
+            const entry = storageConfig.apikeys.find(e => !excludeKeys.includes(e.key));
+            return { key: entry?.key || null, waitTime: 0 };
         }
         return { key: null, waitTime: 0 };
     }
@@ -80,22 +87,24 @@ function findAvailableKey(excludeKeys = []) {
     let lowestWait = Infinity;
     let lowestUsage = Infinity;
     
-    for (const key of availableKeys) {
-        const usage = getCallCount(key);
-        const waitTime = getTimeUntilSlotAvailable(key);
+    for (const entry of availableKeys) {
+        const usage = getCallCount(entry.key);
+        const rateLimit = entry.rateLimit;
+        const usageRatio = usage / rateLimit; // Normalize by rate limit
+        const waitTime = getTimeUntilSlotAvailable(entry.key);
         
-        if (waitTime === 0 && usage < lowestUsage) {
-            lowestUsage = usage;
-            bestKey = key;
+        if (waitTime === 0 && usageRatio < lowestUsage) {
+            lowestUsage = usageRatio;
+            bestKey = entry.key;
             lowestWait = 0;
         } else if (lowestWait > 0 && waitTime < lowestWait) {
             lowestWait = waitTime;
-            bestKey = key;
+            bestKey = entry.key;
         }
     }
     
     if (!bestKey && availableKeys.length > 0) {
-        bestKey = availableKeys[0];
+        bestKey = availableKeys[0].key;
         lowestWait = getTimeUntilSlotAvailable(bestKey);
     }
     
@@ -264,15 +273,16 @@ function getRateLimitStatus() {
     const storageConfig = storage.loadConfig();
     const status = {};
     
-    for (const key of storageConfig.apikeys) {
-        const masked = `...${key.slice(-4)}`;
-        const calls = getCallCount(key);
-        const isFailed = storageConfig.failedKeys && storageConfig.failedKeys[key];
+    for (const entry of storageConfig.apikeys) {
+        const masked = `...${entry.key.slice(-4)}`;
+        const calls = getCallCount(entry.key);
+        const rateLimit = entry.rateLimit;
+        const isFailed = storageConfig.failedKeys && storageConfig.failedKeys[entry.key];
         
         status[masked] = {
             calls,
-            limit: config.api.callsPerKeyPerMinute,
-            available: config.api.callsPerKeyPerMinute - calls,
+            limit: rateLimit,
+            available: rateLimit - calls,
             failed: !!isFailed
         };
     }
@@ -282,11 +292,15 @@ function getRateLimitStatus() {
 
 function estimateCollectionTime(factionCount) {
     const storageConfig = storage.loadConfig();
-    const keyCount = storageConfig.apikeys.length;
     
-    if (keyCount === 0) return Infinity;
+    if (storageConfig.apikeys.length === 0) return Infinity;
     
-    const totalCallsPerMinute = keyCount * config.api.callsPerKeyPerMinute;
+    // Sum up all rate limits
+    const totalCallsPerMinute = storageConfig.apikeys.reduce(
+        (sum, entry) => sum + entry.rateLimit, 
+        0
+    );
+    
     const minutes = factionCount / totalCallsPerMinute;
     
     return Math.ceil(minutes * 60);
@@ -297,6 +311,8 @@ function clearRateLimitLog() {
     apiLog.info('Rate limit log cleared');
 }
 
+const RATE_LIMIT_PER_KEY = config.api.defaultCallsPerKeyPerMinute;
+
 module.exports = {
     fetchFaction,
     fetchHOFPage,
@@ -305,5 +321,5 @@ module.exports = {
     getRateLimitStatus,
     estimateCollectionTime,
     clearRateLimitLog,
-    RATE_LIMIT_PER_KEY: config.api.callsPerKeyPerMinute
+    RATE_LIMIT_PER_KEY
 };

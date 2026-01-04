@@ -23,6 +23,7 @@ function ensureDataDir() {
 // CONFIG
 // ============================================
 
+
 function loadConfig() {
     try {
         const stats = fs.statSync(CONFIG_PATH);
@@ -33,9 +34,18 @@ function loadConfig() {
         const data = fs.readFileSync(CONFIG_PATH, 'utf8');
         const config = JSON.parse(data);
         
-        // Decrypt API keys on load
-        if (config.apikeys) {
-            config.apikeys = config.apikeys.map(key => decrypt(key));
+        // Migrate old format to new format
+        if (config.apikeys && config.apikeys.length > 0 && typeof config.apikeys[0] === 'string') {
+            config.apikeys = config.apikeys.map(key => ({
+                key: decrypt(key),
+                rateLimit: require('../config').api.defaultCallsPerKeyPerMinute
+            }));
+        } else if (config.apikeys) {
+            // Decrypt keys in new format
+            config.apikeys = config.apikeys.map(entry => ({
+                ...entry,
+                key: decrypt(entry.key)
+            }));
         }
         
         configCache = config;
@@ -47,17 +57,19 @@ function loadConfig() {
 }
 
 function saveConfig(config) {
-    // Create a copy with encrypted API keys for saving
+    // Encrypt keys when saving
     const configToSave = {
         ...config,
-        apikeys: config.apikeys.map(key => encrypt(key))
+        apikeys: config.apikeys.map(entry => ({
+            ...entry,
+            key: encrypt(entry.key)
+        }))
     };
     
-    configCache = config; // Keep decrypted version in cache
+    configCache = config;
     configMtime = Date.now();
     fs.writeFileSync(CONFIG_PATH, JSON.stringify(configToSave, null, 2));
 }
-
 // ============================================
 // API KEY MANAGEMENT
 // ============================================
@@ -251,44 +263,69 @@ function removeFactionsByIds(ids) {
     return { removed };
 }
 
-function addApiKeys(keys) {
+function addApiKey(key, rateLimit = null) {
+    const appConfig = require('../config');
     const config = loadConfig();
+    
+    // Use provided rate limit or default
+    const effectiveRateLimit = Math.min(
+        rateLimit || appConfig.api.defaultCallsPerKeyPerMinute,
+        appConfig.api.maxCallsPerKeyPerMinute
+    );
+    
+    // Check if key already exists
+    const exists = config.apikeys.some(entry => entry.key === key);
+    
+    if (exists) {
+        return { added: false, reason: 'Key already exists' };
+    }
+    
+    config.apikeys.push({
+        key,
+        rateLimit: effectiveRateLimit
+    });
+    
+    saveConfig(config);
+    
+    return { added: true, rateLimit: effectiveRateLimit };
+}
+
+function addApiKeys(keys) {
     let added = 0;
     let skipped = 0;
     
     for (const key of keys) {
-        if (!config.apikeys.includes(key)) {
-            config.apikeys.push(key);
+        const result = addApiKey(key);
+        if (result.added) {
             added++;
         } else {
             skipped++;
         }
     }
     
-    if (added > 0) {
-        saveConfig(config);
-    }
-    
     return { added, skipped };
+}
+
+function getKeyRateLimit(key) {
+    const appConfig = require('../config');
+    const config = loadConfig();
+    const entry = config.apikeys.find(e => e.key === key);
+    return entry?.rateLimit || appConfig.api.defaultCallsPerKeyPerMinute;
 }
 
 function removeApiKey(key) {
     const config = loadConfig();
-    const index = config.apikeys.indexOf(key);
+    const initialLength = config.apikeys.length;
     
-    if (index === -1) {
-        return { removed: false };
+    config.apikeys = config.apikeys.filter(entry => entry.key !== key);
+    
+    const removed = initialLength > config.apikeys.length;
+    
+    if (removed) {
+        saveConfig(config);
     }
     
-    config.apikeys.splice(index, 1);
-    
-    if (config.currentKeyIndex >= config.apikeys.length) {
-        config.currentKeyIndex = 0;
-    }
-    
-    saveConfig(config);
-    
-    return { removed: true };
+    return { removed };
 }
 
 // ============================================
@@ -364,6 +401,11 @@ function resolveMember(input) {
     return exact || results[0];
 }
 
+function getApiKeys() {
+    const config = loadConfig();
+    return config.apikeys.map(entry => entry.key);
+}
+
 function getAllFactionChoices() {
     const config = loadConfig();
     const choices = [];
@@ -430,8 +472,11 @@ module.exports = {
     removeFactionsByRank,
     addFactionsByIds,
     removeFactionsByIds,
+    addApiKey,
     addApiKeys,
     removeApiKey,
+    getApiKeys,
+    getKeyRateLimit,
     searchFactionByName,
     searchMemberByName,
     resolveFaction,
