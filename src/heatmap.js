@@ -75,33 +75,29 @@ function aggregateFactionDataHourlyFast(factionId, dayFilter, dataTimestamp) {
     const aggregates = db.getHourlyAggregates(factionId, config.collection.dataRetentionDays);
     
     const result = {};
-    const snapshotCounts = {};
     let globalMax = 0;
     
     for (let hour = 0; hour < 24; hour++) {
         result[hour] = {};
-        snapshotCounts[hour] = {};
         for (const day of daysToShow) {
             result[hour][day] = 0;
-            snapshotCounts[hour][day] = 0;
         }
     }
     
     for (const row of aggregates) {
         if (!daysToShow.includes(row.day_of_week)) continue;
         
-        result[row.hour][row.day_of_week] = row.avg_active || 0;
-        snapshotCounts[row.hour][row.day_of_week] = row.snapshot_count || 0;
+        const avg = row.avg_unique || 0;
+        result[row.hour][row.day_of_week] = avg;
         
-        if (row.avg_active > globalMax) globalMax = row.avg_active;
+        if (avg > globalMax) globalMax = avg;
     }
     
     const output = { 
         data: result, 
         min: 0, 
         max: globalMax, 
-        days: daysToShow,
-        snapshotCounts
+        days: daysToShow
     };
     
     aggregateCache.set(cacheKey, output);
@@ -129,7 +125,7 @@ function aggregateFactionData15MinFast(factionId, dayFilter, dataTimestamp) {
     for (const row of aggregates) {
         if (!daysToShow.includes(row.day_of_week)) continue;
         
-        const avg = row.avg_active || 0;
+        const avg = row.avg_unique || 0;
         result[row.hour][row.day_of_week][row.slot] = avg;
         
         if (avg > globalMax) globalMax = avg;
@@ -146,9 +142,6 @@ function aggregateFactionData15MinFast(factionId, dayFilter, dataTimestamp) {
     aggregateCache.set(cacheKey, output);
     return output;
 }
-// ============================================
-// USER AGGREGATION (needs raw snapshots)
-// ============================================
 
 function aggregateUserDataHourlyMultiFaction(userId, dayFilter, dataTimestamp) {
     const cacheKey = `user:hourly:${userId}:${dayFilter}`;
@@ -156,48 +149,29 @@ function aggregateUserDataHourlyMultiFaction(userId, dayFilter, dataTimestamp) {
     if (cached) return cached;
     
     const daysToShow = parseDaysFilter(dayFilter);
-    const thirtyDaysAgo = getThirtyDaysAgo();
-    const now = Math.floor(Date.now() / 1000);
-    
     const factionIds = storage.findUserInAllFactions(userId);
     
     if (factionIds.length === 0) return null;
     
-    const hourlyData = {};
-    for (let hour = 0; hour < 24; hour++) {
-        hourlyData[hour] = {};
-        for (const day of daysToShow) {
-            hourlyData[hour][day] = { weeksWithData: new Set(), weeksActive: new Set() };
-        }
-    }
-    
-    for (const factionId of factionIds) {
-        const snapshots = db.getSnapshotsNormalized(factionId, thirtyDaysAgo);
-        
-        for (const snapshot of snapshots) {
-            const day = getDayOfWeek(snapshot.timestamp);
-            if (!daysToShow.includes(day)) continue;
-            
-            const hour = getHourFromTimestamp(snapshot.timestamp);
-            const weekId = `${factionId}-${getWeekId(snapshot.timestamp, now)}`;
-            
-            hourlyData[hour][day].weeksWithData.add(weekId);
-            if (snapshot.active.includes(userId)) {
-                hourlyData[hour][day].weeksActive.add(weekId);
-            }
-        }
-    }
+    const aggregates = db.getUserHourlyActivity(userId, factionIds, config.collection.dataRetentionDays);
     
     const result = {};
     
     for (let hour = 0; hour < 24; hour++) {
         result[hour] = {};
         for (const day of daysToShow) {
-            const { weeksWithData, weeksActive } = hourlyData[hour][day];
-            result[hour][day] = weeksWithData.size === 0 
-                ? 0 
-                : Math.round((weeksActive.size / weeksWithData.size) * 100);
+            result[hour][day] = 0;
         }
+    }
+    
+    for (const row of aggregates) {
+        if (!daysToShow.includes(row.day_of_week)) continue;
+        
+        const percentage = row.total_occurrences > 0 
+            ? Math.round((row.times_active / row.total_occurrences) * 100) 
+            : 0;
+        
+        result[row.hour][row.day_of_week] = percentage;
     }
     
     const output = { 
@@ -219,59 +193,29 @@ function aggregateUserData15MinMultiFaction(userId, dayFilter, dataTimestamp) {
     if (cached) return cached;
     
     const daysToShow = parseDaysFilter(dayFilter);
-    const thirtyDaysAgo = getThirtyDaysAgo();
-    
     const factionIds = storage.findUserInAllFactions(userId);
     
     if (factionIds.length === 0) return null;
     
-    const data = {};
-    for (let hour = 0; hour < 24; hour++) {
-        data[hour] = {};
-        for (const day of daysToShow) {
-            data[hour][day] = [
-                { total: 0, active: 0 },
-                { total: 0, active: 0 },
-                { total: 0, active: 0 },
-                { total: 0, active: 0 }
-            ];
-        }
-    }
-    
-    const processedSnapshots = new Set();
-    
-    for (const factionId of factionIds) {
-        const snapshots = db.getSnapshotsNormalized(factionId, thirtyDaysAgo);
-        
-        for (const snapshot of snapshots) {
-            const key = snapshot.timestamp.toString();
-            if (processedSnapshots.has(key)) continue;
-            processedSnapshots.add(key);
-            
-            const day = getDayOfWeek(snapshot.timestamp);
-            if (!daysToShow.includes(day)) continue;
-            
-            const hour = getHourFromTimestamp(snapshot.timestamp);
-            const slot = get15MinSlotInHour(snapshot.timestamp);
-            
-            data[hour][day][slot].total++;
-            if (snapshot.active.includes(userId)) {
-                data[hour][day][slot].active++;
-            }
-        }
-    }
+    const aggregates = db.getUser15MinActivity(userId, factionIds, config.collection.dataRetentionDays);
     
     const result = {};
     
     for (let hour = 0; hour < 24; hour++) {
         result[hour] = {};
         for (const day of daysToShow) {
-            result[hour][day] = [];
-            for (let slot = 0; slot < 4; slot++) {
-                const { total, active } = data[hour][day][slot];
-                result[hour][day].push(total === 0 ? 0 : Math.round((active / total) * 100));
-            }
+            result[hour][day] = [0, 0, 0, 0];
         }
+    }
+    
+    for (const row of aggregates) {
+        if (!daysToShow.includes(row.day_of_week)) continue;
+        
+        const percentage = row.total_occurrences > 0 
+            ? Math.round((row.times_active / row.total_occurrences) * 100) 
+            : 0;
+        
+        result[row.hour][row.day_of_week][row.slot] = percentage;
     }
     
     const output = { 

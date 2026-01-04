@@ -422,15 +422,26 @@ function getMemberActivity(memberId, factionId, days = 30) {
 function getHourlyAggregates(factionId, daysBack = config.collection.dataRetentionDays) {
     const cutoff = Math.floor(Date.now() / 1000) - (daysBack * 24 * 60 * 60);
     
-    // Simple average of active_count per hour/day across all snapshots
+    // For each date+hour, count unique members
+    // Then average across dates for same day_of_week+hour
     return getDb().prepare(`
+        WITH hourly_unique AS (
+            SELECT 
+                DATE(datetime(s.timestamp, 'unixepoch')) as date,
+                CAST(strftime('%w', datetime(s.timestamp, 'unixepoch')) AS INTEGER) as day_of_week,
+                CAST(strftime('%H', datetime(s.timestamp, 'unixepoch')) AS INTEGER) as hour,
+                COUNT(DISTINCT sm.member_id) as unique_members
+            FROM snapshots s
+            JOIN snapshot_members sm ON s.id = sm.snapshot_id
+            WHERE s.faction_id = ? AND s.timestamp >= ?
+            GROUP BY date, day_of_week, hour
+        )
         SELECT 
-            CAST(strftime('%w', datetime(timestamp, 'unixepoch')) AS INTEGER) as day_of_week,
-            CAST(strftime('%H', datetime(timestamp, 'unixepoch')) AS INTEGER) as hour,
-            ROUND(AVG(active_count), 1) as avg_active,
-            COUNT(*) as snapshot_count
-        FROM snapshots
-        WHERE faction_id = ? AND timestamp >= ?
+            day_of_week,
+            hour,
+            ROUND(AVG(unique_members), 1) as avg_unique,
+            COUNT(*) as num_occurrences
+        FROM hourly_unique
         GROUP BY day_of_week, hour
         ORDER BY day_of_week, hour
     `).all(factionId, cutoff);
@@ -439,15 +450,28 @@ function getHourlyAggregates(factionId, daysBack = config.collection.dataRetenti
 function get15MinAggregates(factionId, daysBack = config.collection.dataRetentionDays) {
     const cutoff = Math.floor(Date.now() / 1000) - (daysBack * 24 * 60 * 60);
     
+    // For each date+hour+slot, count unique members
+    // Then average across dates for same day_of_week+hour+slot
     return getDb().prepare(`
+        WITH slot_unique AS (
+            SELECT 
+                DATE(datetime(s.timestamp, 'unixepoch')) as date,
+                CAST(strftime('%w', datetime(s.timestamp, 'unixepoch')) AS INTEGER) as day_of_week,
+                CAST(strftime('%H', datetime(s.timestamp, 'unixepoch')) AS INTEGER) as hour,
+                CAST(strftime('%M', datetime(s.timestamp, 'unixepoch')) AS INTEGER) / 15 as slot,
+                COUNT(DISTINCT sm.member_id) as unique_members
+            FROM snapshots s
+            JOIN snapshot_members sm ON s.id = sm.snapshot_id
+            WHERE s.faction_id = ? AND s.timestamp >= ?
+            GROUP BY date, day_of_week, hour, slot
+        )
         SELECT 
-            CAST(strftime('%w', datetime(timestamp, 'unixepoch')) AS INTEGER) as day_of_week,
-            CAST(strftime('%H', datetime(timestamp, 'unixepoch')) AS INTEGER) as hour,
-            CAST(strftime('%M', datetime(timestamp, 'unixepoch')) AS INTEGER) / 15 as slot,
-            ROUND(AVG(active_count), 1) as avg_active,
-            COUNT(*) as snapshot_count
-        FROM snapshots
-        WHERE faction_id = ? AND timestamp >= ?
+            day_of_week,
+            hour,
+            slot,
+            ROUND(AVG(unique_members), 1) as avg_unique,
+            COUNT(*) as num_occurrences
+        FROM slot_unique
         GROUP BY day_of_week, hour, slot
         ORDER BY day_of_week, hour, slot
     `).all(factionId, cutoff);
@@ -460,18 +484,29 @@ function getUserHourlyActivity(userId, factionIds, daysBack = config.collection.
     
     const placeholders = factionIds.map(() => '?').join(',');
     
+    // For each date+hour, check if user was active at least once
+    // Then count occurrences where user was active vs total occurrences
     return getDb().prepare(`
+        WITH hourly_presence AS (
+            SELECT 
+                DATE(datetime(s.timestamp, 'unixepoch')) as date,
+                CAST(strftime('%w', datetime(s.timestamp, 'unixepoch')) AS INTEGER) as day_of_week,
+                CAST(strftime('%H', datetime(s.timestamp, 'unixepoch')) AS INTEGER) as hour,
+                MAX(CASE WHEN sm.member_id IS NOT NULL THEN 1 ELSE 0 END) as was_active
+            FROM snapshots s
+            LEFT JOIN snapshot_members sm ON s.id = sm.snapshot_id AND sm.member_id = ?
+            WHERE s.faction_id IN (${placeholders}) AND s.timestamp >= ?
+            GROUP BY date, day_of_week, hour
+        )
         SELECT 
-            CAST(strftime('%w', datetime(s.timestamp, 'unixepoch')) AS INTEGER) as day_of_week,
-            CAST(strftime('%H', datetime(s.timestamp, 'unixepoch')) AS INTEGER) as hour,
-            COUNT(DISTINCT s.id) as total_snapshots,
-            COUNT(DISTINCT CASE WHEN sm.member_id = ? THEN s.id END) as times_active
-        FROM snapshots s
-        LEFT JOIN snapshot_members sm ON s.id = sm.snapshot_id AND sm.member_id = ?
-        WHERE s.faction_id IN (${placeholders}) AND s.timestamp >= ?
+            day_of_week,
+            hour,
+            SUM(was_active) as times_active,
+            COUNT(*) as total_occurrences
+        FROM hourly_presence
         GROUP BY day_of_week, hour
         ORDER BY day_of_week, hour
-    `).all(userId, userId, ...factionIds, cutoff);
+    `).all(userId, ...factionIds, cutoff);
 }
 
 function getUser15MinActivity(userId, factionIds, daysBack = config.collection.dataRetentionDays) {
@@ -481,19 +516,31 @@ function getUser15MinActivity(userId, factionIds, daysBack = config.collection.d
     
     const placeholders = factionIds.map(() => '?').join(',');
     
+    // For each date+hour+slot, check if user was active at least once
+    // Then count occurrences where user was active vs total occurrences
     return getDb().prepare(`
+        WITH slot_presence AS (
+            SELECT 
+                DATE(datetime(s.timestamp, 'unixepoch')) as date,
+                CAST(strftime('%w', datetime(s.timestamp, 'unixepoch')) AS INTEGER) as day_of_week,
+                CAST(strftime('%H', datetime(s.timestamp, 'unixepoch')) AS INTEGER) as hour,
+                CAST(strftime('%M', datetime(s.timestamp, 'unixepoch')) AS INTEGER) / 15 as slot,
+                MAX(CASE WHEN sm.member_id IS NOT NULL THEN 1 ELSE 0 END) as was_active
+            FROM snapshots s
+            LEFT JOIN snapshot_members sm ON s.id = sm.snapshot_id AND sm.member_id = ?
+            WHERE s.faction_id IN (${placeholders}) AND s.timestamp >= ?
+            GROUP BY date, day_of_week, hour, slot
+        )
         SELECT 
-            CAST(strftime('%w', datetime(s.timestamp, 'unixepoch')) AS INTEGER) as day_of_week,
-            CAST(strftime('%H', datetime(s.timestamp, 'unixepoch')) AS INTEGER) as hour,
-            CAST(strftime('%M', datetime(s.timestamp, 'unixepoch')) AS INTEGER) / 15 as slot,
-            COUNT(DISTINCT s.id) as total_snapshots,
-            COUNT(DISTINCT CASE WHEN sm.member_id = ? THEN s.id END) as times_active
-        FROM snapshots s
-        LEFT JOIN snapshot_members sm ON s.id = sm.snapshot_id AND sm.member_id = ?
-        WHERE s.faction_id IN (${placeholders}) AND s.timestamp >= ?
+            day_of_week,
+            hour,
+            slot,
+            SUM(was_active) as times_active,
+            COUNT(*) as total_occurrences
+        FROM slot_presence
         GROUP BY day_of_week, hour, slot
         ORDER BY day_of_week, hour, slot
-    `).all(userId, userId, ...factionIds, cutoff);
+    `).all(userId, ...factionIds, cutoff);
 }
 
 function getWeekCount(factionId, daysBack = config.collection.dataRetentionDays) {
