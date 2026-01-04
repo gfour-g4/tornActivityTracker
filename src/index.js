@@ -9,6 +9,7 @@ const { botLog } = require('./utils/logger');
 
 const activityCommand = require('./commands/activity');
 const exportCommand = require('./commands/export');
+const helpCommand = require('./commands/help');
 
 const client = new Client({ 
     intents: [GatewayIntentBits.Guilds] 
@@ -17,6 +18,7 @@ const client = new Client({
 client.commands = new Collection();
 client.commands.set(activityCommand.data.name, activityCommand);
 client.commands.set(exportCommand.data.name, exportCommand);
+client.commands.set(helpCommand.data.name, helpCommand);
 
 let presenceInterval = null;
 let isShuttingDown = false;
@@ -44,7 +46,8 @@ async function registerCommands() {
     
     const commands = [
         activityCommand.data.toJSON(),
-        exportCommand.data.toJSON()
+        exportCommand.data.toJSON(),
+        helpCommand.data.toJSON()
     ];
     
     try {
