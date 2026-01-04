@@ -146,7 +146,6 @@ function aggregateFactionData15MinFast(factionId, dayFilter, dataTimestamp) {
     aggregateCache.set(cacheKey, output);
     return output;
 }
-
 // ============================================
 // USER AGGREGATION (needs raw snapshots)
 // ============================================

@@ -453,6 +453,49 @@ function get15MinAggregates(factionId, daysBack = config.collection.dataRetentio
     `).all(factionId, cutoff);
 }
 
+function getUserHourlyActivity(userId, factionIds, daysBack = config.collection.dataRetentionDays) {
+    const cutoff = Math.floor(Date.now() / 1000) - (daysBack * 24 * 60 * 60);
+    
+    if (factionIds.length === 0) return [];
+    
+    const placeholders = factionIds.map(() => '?').join(',');
+    
+    return getDb().prepare(`
+        SELECT 
+            CAST(strftime('%w', datetime(s.timestamp, 'unixepoch')) AS INTEGER) as day_of_week,
+            CAST(strftime('%H', datetime(s.timestamp, 'unixepoch')) AS INTEGER) as hour,
+            COUNT(DISTINCT s.id) as total_snapshots,
+            COUNT(DISTINCT CASE WHEN sm.member_id = ? THEN s.id END) as times_active
+        FROM snapshots s
+        LEFT JOIN snapshot_members sm ON s.id = sm.snapshot_id AND sm.member_id = ?
+        WHERE s.faction_id IN (${placeholders}) AND s.timestamp >= ?
+        GROUP BY day_of_week, hour
+        ORDER BY day_of_week, hour
+    `).all(userId, userId, ...factionIds, cutoff);
+}
+
+function getUser15MinActivity(userId, factionIds, daysBack = config.collection.dataRetentionDays) {
+    const cutoff = Math.floor(Date.now() / 1000) - (daysBack * 24 * 60 * 60);
+    
+    if (factionIds.length === 0) return [];
+    
+    const placeholders = factionIds.map(() => '?').join(',');
+    
+    return getDb().prepare(`
+        SELECT 
+            CAST(strftime('%w', datetime(s.timestamp, 'unixepoch')) AS INTEGER) as day_of_week,
+            CAST(strftime('%H', datetime(s.timestamp, 'unixepoch')) AS INTEGER) as hour,
+            CAST(strftime('%M', datetime(s.timestamp, 'unixepoch')) AS INTEGER) / 15 as slot,
+            COUNT(DISTINCT s.id) as total_snapshots,
+            COUNT(DISTINCT CASE WHEN sm.member_id = ? THEN s.id END) as times_active
+        FROM snapshots s
+        LEFT JOIN snapshot_members sm ON s.id = sm.snapshot_id AND sm.member_id = ?
+        WHERE s.faction_id IN (${placeholders}) AND s.timestamp >= ?
+        GROUP BY day_of_week, hour, slot
+        ORDER BY day_of_week, hour, slot
+    `).all(userId, userId, ...factionIds, cutoff);
+}
+
 function getWeekCount(factionId, daysBack = config.collection.dataRetentionDays) {
     const cutoffDate = new Date(Date.now() - daysBack * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
     
@@ -595,5 +638,9 @@ module.exports = {
     getUserLastUpdated,
 
     // Slot check
-    hasSnapshotForSlot
+    hasSnapshotForSlot,
+
+    // User activity
+    getUserHourlyActivity,
+    getUser15MinActivity,
 };
