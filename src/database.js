@@ -422,45 +422,35 @@ function getMemberActivity(memberId, factionId, days = 30) {
 function getHourlyAggregates(factionId, daysBack = config.collection.dataRetentionDays) {
     const cutoff = Math.floor(Date.now() / 1000) - (daysBack * 24 * 60 * 60);
     
-    // Get unique members per hour per week, then average across weeks
+    // Simple average of active_count per hour/day across all snapshots
     return getDb().prepare(`
-        WITH hourly_unique AS (
-            SELECT 
-                strftime('%Y-%W', datetime(s.timestamp, 'unixepoch')) as week,
-                CAST(strftime('%w', datetime(s.timestamp, 'unixepoch')) AS INTEGER) as day_of_week,
-                CAST(strftime('%H', datetime(s.timestamp, 'unixepoch')) AS INTEGER) as hour,
-                COUNT(DISTINCT sm.member_id) as unique_members
-            FROM snapshots s
-            JOIN snapshot_members sm ON s.id = sm.snapshot_id
-            WHERE s.faction_id = ? AND s.timestamp >= ?
-            GROUP BY week, day_of_week, hour
-        )
         SELECT 
-            day_of_week,
-            hour,
-            ROUND(AVG(unique_members), 1) as avg_unique,
-            COUNT(*) as week_count
-        FROM hourly_unique
+            CAST(strftime('%w', datetime(timestamp, 'unixepoch')) AS INTEGER) as day_of_week,
+            CAST(strftime('%H', datetime(timestamp, 'unixepoch')) AS INTEGER) as hour,
+            ROUND(AVG(active_count), 1) as avg_active,
+            COUNT(*) as snapshot_count
+        FROM snapshots
+        WHERE faction_id = ? AND timestamp >= ?
         GROUP BY day_of_week, hour
         ORDER BY day_of_week, hour
     `).all(factionId, cutoff);
 }
 
 function get15MinAggregates(factionId, daysBack = config.collection.dataRetentionDays) {
-    const cutoffDate = new Date(Date.now() - daysBack * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+    const cutoff = Math.floor(Date.now() / 1000) - (daysBack * 24 * 60 * 60);
     
     return getDb().prepare(`
         SELECT 
-            day_of_week,
-            hour,
-            slot,
-            SUM(unique_active) as total_active,
-            SUM(snapshot_count) as total_snapshots
-        FROM daily_aggregates
-        WHERE faction_id = ? AND date >= ?
+            CAST(strftime('%w', datetime(timestamp, 'unixepoch')) AS INTEGER) as day_of_week,
+            CAST(strftime('%H', datetime(timestamp, 'unixepoch')) AS INTEGER) as hour,
+            CAST(strftime('%M', datetime(timestamp, 'unixepoch')) AS INTEGER) / 15 as slot,
+            ROUND(AVG(active_count), 1) as avg_active,
+            COUNT(*) as snapshot_count
+        FROM snapshots
+        WHERE faction_id = ? AND timestamp >= ?
         GROUP BY day_of_week, hour, slot
         ORDER BY day_of_week, hour, slot
-    `).all(factionId, cutoffDate);
+    `).all(factionId, cutoff);
 }
 
 function getWeekCount(factionId, daysBack = config.collection.dataRetentionDays) {
